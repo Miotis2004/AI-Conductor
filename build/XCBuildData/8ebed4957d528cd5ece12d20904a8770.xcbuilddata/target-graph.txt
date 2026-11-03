@@ -1,0 +1,4 @@
+Target dependency graph (2 targets)
+Target 'AI_ConnectorTests' in project 'AI_Connector'
+➜ Explicit dependency on target 'AI_Connector' in project 'AI_Connector'
+Target 'AI_Connector' in project 'AI_Connector' (no dependencies)

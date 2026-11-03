@@ -178,13 +178,25 @@ final class ChatViewModel {
 
             // Estimate tokens if the server didn't report usage.
             // Rough estimate: ~4 characters per token for English text.
-            let estimatedTokens = max(1, response.count / 4)
+            // Only estimate when content was actually received.
+            let estimatedTokens: Int?
+            if receivedAnyContent {
+                estimatedTokens = max(1, response.count / 4)
+            } else {
+                estimatedTokens = 0
+            }
             let outputTokens = serverReportedTokens ?? estimatedTokens
             let isServerReported = serverReportedTokens != nil
 
             // Tokens per second: tokens generated / time from first token to end.
-            let generationTime = firstTokenTime.map { endTime.timeIntervalSince($0) } ?? totalElapsed
-            let tps = generationTime > 0 ? Double(outputTokens) / generationTime : nil
+            // Only compute when we actually have tokens and a valid time window.
+            let tps: Double?
+            if let tokens = outputTokens, tokens > 0, let firstTime = firstTokenTime {
+                let generationTime = endTime.timeIntervalSince(firstTime)
+                tps = generationTime > 0 ? Double(tokens) / generationTime : nil
+            } else {
+                tps = nil
+            }
 
             self.requestStats = RequestStats(
                 timeToFirstToken: ttft,
@@ -227,12 +239,22 @@ final class ChatViewModel {
             response = content
 
             let serverTokens = result.usage?.completionTokens
-            let estimatedTokens = max(1, content.count / 4)
+            let estimatedTokens: Int?
+            if !content.isEmpty {
+                estimatedTokens = max(1, content.count / 4)
+            } else {
+                estimatedTokens = 0
+            }
             let outputTokens = serverTokens ?? estimatedTokens
             let isServerReported = serverTokens != nil
 
             // For non-streaming, TTFT == total elapsed (no incremental delivery).
-            let tps = totalElapsed > 0 ? Double(outputTokens) / totalElapsed : nil
+            let tps: Double?
+            if let tokens = outputTokens, tokens > 0, totalElapsed > 0 {
+                tps = Double(tokens) / totalElapsed
+            } else {
+                tps = nil
+            }
 
             requestStats = RequestStats(
                 timeToFirstToken: totalElapsed,

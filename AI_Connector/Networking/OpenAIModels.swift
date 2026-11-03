@@ -88,12 +88,24 @@ struct OpenAIErrorDetail: Codable, Sendable {
 
 // MARK: - Streaming Models
 
+/// An incremental delta in a streaming chat completion chunk.
+///
+/// Both `role` and `content` are optional because streaming deltas
+/// frequently contain only one or the other:
+/// - The first chunk typically contains only `role` (e.g. `"assistant"`).
+/// - Subsequent chunks typically contain only `content` (incremental text).
+/// - The final chunk may contain only `finish_reason` with an empty delta.
+struct ChatCompletionStreamDelta: Codable, Hashable, Sendable {
+    let role: String?
+    let content: String?
+}
+
 /// A single choice in a streaming chat completion chunk.
 ///
 /// In streaming mode, `delta` contains incremental content rather than a full `message`.
 struct ChatCompletionStreamChoice: Codable, Sendable {
     let index: Int
-    let delta: ChatMessage
+    let delta: ChatCompletionStreamDelta
     let finishReason: String?
 
     enum CodingKeys: String, CodingKey {

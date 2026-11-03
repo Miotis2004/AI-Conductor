@@ -1,0 +1,136 @@
+{
+  "source": "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/AI_Connector/ContentView.swift",
+  "tables": {
+    "Localizable": [
+      {
+        "comment": "",
+        "key": "Base URL",
+        "location": {
+          "startingColumn": 23,
+          "startingLine": 51
+        }
+      },
+      {
+        "comment": "",
+        "key": "Configure the API key (stored in Keychain)",
+        "location": {
+          "startingColumn": 19,
+          "startingLine": 63
+        }
+      },
+      {
+        "comment": "",
+        "key": "Set API Key",
+        "location": {
+          "startingColumn": 48,
+          "startingLine": 59
+        }
+      },
+      {
+        "comment": "",
+        "key": "API Key Set",
+        "location": {
+          "startingColumn": 64,
+          "startingLine": 59
+        }
+      },
+      {
+        "comment": "",
+        "key": "Connect",
+        "location": {
+          "startingColumn": 27,
+          "startingLine": 74
+        }
+      },
+      {
+        "comment": "",
+        "key": "Model",
+        "location": {
+          "startingColumn": 20,
+          "startingLine": 119
+        }
+      },
+      {
+        "comment": "",
+        "key": "No models available",
+        "location": {
+          "startingColumn": 26,
+          "startingLine": 121
+        }
+      },
+      {
+        "comment": "",
+        "key": "Prompt",
+        "location": {
+          "startingColumn": 18,
+          "startingLine": 149
+        }
+      },
+      {
+        "comment": "",
+        "key": "Send",
+        "location": {
+          "startingColumn": 31,
+          "startingLine": 179
+        }
+      },
+      {
+        "comment": "",
+        "key": "Generating…",
+        "location": {
+          "startingColumn": 34,
+          "startingLine": 176
+        }
+      },
+      {
+        "comment": "",
+        "key": "Stop",
+        "location": {
+          "startingColumn": 31,
+          "startingLine": 194
+        }
+      },
+      {
+        "comment": "",
+        "key": "Response",
+        "location": {
+          "startingColumn": 18,
+          "startingLine": 211
+        }
+      },
+      {
+        "comment": "",
+        "key": "Waiting for response…",
+        "location": {
+          "startingColumn": 28,
+          "startingLine": 218
+        }
+      },
+      {
+        "comment": "",
+        "key": "The assistant's response will appear here.",
+        "location": {
+          "startingColumn": 28,
+          "startingLine": 219
+        }
+      },
+      {
+        "comment": "",
+        "key": "est.",
+        "location": {
+          "startingColumn": 22,
+          "startingLine": 305
+        }
+      },
+      {
+        "comment": "",
+        "key": "Estimated locally — not reported by the server",
+        "location": {
+          "startingColumn": 27,
+          "startingLine": 308
+        }
+      }
+    ]
+  },
+  "version": 1
+}

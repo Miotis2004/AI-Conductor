@@ -12,6 +12,7 @@
   },
   "files": [
     { "kind": "folder", "path": "AI_Connector", "target-membership": [ "AI_Connector" ] },
+    { "kind": "folder", "path": "AI_ConnectorTests", "target-membership": [] },
     {
       "kind": "group",
       "name": "Products",

@@ -1,0 +1,16 @@
+{
+  "" : {
+    "const-values" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/AI_ConnectorTests-primary.swiftconstvalues",
+    "dependencies" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/AI_ConnectorTests-primary.d",
+    "diagnostics" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/AI_ConnectorTests-primary.dia",
+    "emit-module-dependencies" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/AI_ConnectorTests-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/AI_ConnectorTests-primary-emit-module.dia",
+    "pch" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/AI_ConnectorTests-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/AI_ConnectorTests-primary.swiftdeps"
+  },
+  "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/AI_ConnectorTests/StreamingTests.swift" : {
+    "index-unit-output-path" : "/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/StreamingTests.o",
+    "llvm-bc" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/StreamingTests.bc",
+    "object" : "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/build/AI_Connector.build/Release/AI_ConnectorTests.build/Objects-normal/arm64/StreamingTests.o"
+  }
+}

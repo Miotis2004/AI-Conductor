@@ -10,6 +10,8 @@ enum OpenAIError: LocalizedError {
     case networkError(underlying: Error)
     case emptyModelList
     case noChoices
+    case streamEndedWithoutContent
+    case invalidUTF8
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +27,10 @@ enum OpenAIError: LocalizedError {
             return "The server returned no models."
         case .noChoices:
             return "The server returned no completion choices."
+        case .streamEndedWithoutContent:
+            return "The stream ended without returning any content."
+        case .invalidUTF8:
+            return "The server returned invalid UTF-8 data."
         }
     }
 }
@@ -124,121 +130,201 @@ struct OpenAIClient: Sendable {
 
     /// Sends a streaming chat completion request to `POST /v1/chat/completions` with `stream: true`.
     ///
-    /// Parses Server-Sent Events incrementally and yields each `ChatCompletionStreamChunk`
-    /// as it arrives. The caller is responsible for cancellation via the returned `Task`.
+    /// Parses Server-Sent Events incrementally with proper UTF-8 handling and
+    /// yields each `ChatCompletionStreamChunk` as it arrives.
     ///
     /// - Parameters:
     ///   - model: The model identifier to use.
     ///   - prompt: The user's prompt text.
     /// - Returns: An `AsyncThrowingStream` of `ChatCompletionStreamChunk` values.
-    /// - Throws: `OpenAIError` if the request fails or the response is not a valid SSE stream.
+    /// - Throws: `OpenAIError` if the request fails, the stream contains invalid
+    ///   UTF-8, or the stream ends without any valid content.
     func streamChatCompletion(
         model: String,
         prompt: String
     ) -> AsyncThrowingStream<ChatCompletionStreamChunk, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
-                let url = self.baseURL.appendingPathComponent("chat/completions")
-                var request = URLRequest(url: url)
-                request.httpMethod = "POST"
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                self.applyAuth(to: &request)
-
-                let body = ChatCompletionRequest(
-                    model: model,
-                    messages: [ChatMessage(role: "user", content: prompt)],
-                    stream: true
-                )
-                request.httpBody = try JSONEncoder().encode(body)
-
-                // Use bytes(for:) for incremental streaming.
-                let (bytes, response) = try await self.session.bytes(for: request)
-
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw OpenAIError.networkError(
-                        underlying: NSError(
-                            domain: "OpenAIClient",
-                            code: -1,
-                            userInfo: [NSLocalizedDescriptionKey: "Invalid response type"]
-                        )
+                do {
+                    try await self.runStream(
+                        model: model,
+                        prompt: prompt,
+                        continuation: continuation
                     )
+                } catch is CancellationError {
+                    // Cancellation is not an error — finish cleanly.
+                    continuation.finish()
+                } catch let error as OpenAIError {
+                    continuation.finish(throwing: error)
+                } catch {
+                    continuation.finish(throwing: OpenAIError.networkError(underlying: error))
                 }
-
-                guard (200..<300).contains(httpResponse.statusCode) else {
-                    // Read the error body for a useful message.
-                    var errorData = Data()
-                    for try await byte in bytes {
-                        errorData.append(byte)
-                        if errorData.count > 4096 { break }
-                    }
-                    let message = Self.extractErrorMessage(from: errorData)
-                    throw OpenAIError.httpError(
-                        statusCode: httpResponse.statusCode,
-                        message: message
-                    )
-                }
-
-                // Parse SSE lines incrementally.
-                var buffer = ""
-                for try await byte in bytes {
-                    if Task.isCancelled {
-                        continuation.finish()
-                        return
-                    }
-
-                    buffer.append(Character(UnicodeScalar(byte)))
-
-                    // SSE events are separated by newlines.
-                    while let newlineRange = buffer.range(of: "\n") {
-                        let line = String(buffer[..<newlineRange.lowerBound])
-                        buffer = String(buffer[newlineRange.upperBound...])
-
-                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-                        // Skip empty lines (event separators) and comments.
-                        guard !trimmed.isEmpty, !trimmed.hasPrefix(":") else { continue }
-
-                        // SSE data lines start with "data: ".
-                        guard trimmed.hasPrefix("data:") else { continue }
-
-                        let dataString = trimmed
-                            .dropFirst(5) // Remove "data:"
-                            .trimmingCharacters(in: .whitespaces)
-
-                        // "[DONE]" signals the end of the stream.
-                        if dataString == "[DONE]" {
-                            continuation.finish()
-                            return
-                        }
-
-                        // Decode the JSON chunk.
-                        guard let data = dataString.data(using: .utf8) else {
-                            continue
-                        }
-
-                        do {
-                            let chunk = try JSONDecoder().decode(
-                                ChatCompletionStreamChunk.self,
-                                from: data
-                            )
-                            continuation.yield(chunk)
-                        } catch {
-                            // Malformed chunk — skip it but continue the stream.
-                            // The caller can decide how to handle decode failures.
-                            NSLog("OpenAIClient: Failed to decode SSE chunk: \(error.localizedDescription)")
-                        }
-                    }
-                }
-
-                // Stream ended normally.
-                continuation.finish()
             }
 
             continuation.onTermination = { _ in
                 task.cancel()
             }
         }
+    }
+
+    // MARK: - SSE Streaming Implementation
+
+    /// Executes the streaming request and feeds parsed chunks into the continuation.
+    ///
+    /// Uses `URLSession.AsyncBytes` for incremental delivery, with a UTF-8
+    /// incremental decoder to handle multi-byte characters that span chunk
+    /// boundaries. All errors (network, HTTP, decoding, cancellation) are
+    /// propagated to the continuation.
+    private func runStream(
+        model: String,
+        prompt: String,
+        continuation: AsyncThrowingStream<ChatCompletionStreamChunk, Error>.Continuation
+    ) async throws {
+        let url = baseURL.appendingPathComponent("chat/completions")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        applyAuth(to: &request)
+
+        let body = ChatCompletionRequest(
+            model: model,
+            messages: [ChatMessage(role: "user", content: prompt)],
+            stream: true
+        )
+        request.httpBody = try JSONEncoder().encode(body)
+
+        // Use bytes(for:) for incremental streaming.
+        let (bytes, response) = try await session.bytes(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OpenAIError.networkError(
+                underlying: NSError(
+                    domain: "OpenAIClient",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid response type"]
+                )
+            )
+        }
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            // Read the error body for a useful message.
+            var errorData = Data()
+            for try await byte in bytes {
+                errorData.append(byte)
+                if errorData.count > 4096 { break }
+            }
+            let message = Self.extractErrorMessage(from: errorData)
+            throw OpenAIError.httpError(
+                statusCode: httpResponse.statusCode,
+                message: message
+            )
+        }
+
+        // Parse SSE events incrementally with proper UTF-8 handling.
+        var utf8Decoder = UTF8IncrementalDecoder()
+        var lineBuffer = ""
+        var receivedAnyContent = false
+
+        for try await byte in bytes {
+            // Check for cancellation on each byte.
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+
+            // Decode the byte into a character, handling multi-byte UTF-8
+            // sequences that may span chunk boundaries.
+            let decoded = utf8Decoder.decode(byte)
+            switch decoded {
+            case .success(let char):
+                lineBuffer.append(char)
+            case .needMoreData:
+                // Incomplete multi-byte sequence — wait for more bytes.
+                continue
+            case .failure:
+                throw OpenAIError.invalidUTF8
+            }
+
+            // Process complete lines.
+            while let newlineRange = lineBuffer.range(of: "\n") {
+                let line = String(lineBuffer[..<newlineRange.lowerBound])
+                lineBuffer = String(lineBuffer[newlineRange.upperBound...])
+
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+                // Skip empty lines (event separators) and comments.
+                guard !trimmed.isEmpty, !trimmed.hasPrefix(":") else { continue }
+
+                // SSE data lines start with "data:".
+                guard trimmed.hasPrefix("data:") else { continue }
+
+                let dataString = trimmed
+                    .dropFirst(5) // Remove "data:"
+                    .trimmingCharacters(in: .whitespaces)
+
+                // "[DONE]" signals the end of the stream.
+                if dataString == "[DONE]" {
+                    if !receivedAnyContent {
+                        throw OpenAIError.streamEndedWithoutContent
+                    }
+                    continuation.finish()
+                    return
+                }
+
+                // Decode the JSON chunk.
+                guard let data = dataString.data(using: .utf8) else {
+                    NSLog("OpenAIClient: Skipping SSE data line with invalid UTF-8: \(dataString.prefix(100))")
+                    continue
+                }
+
+                do {
+                    let chunk = try JSONDecoder().decode(
+                        ChatCompletionStreamChunk.self,
+                        from: data
+                    )
+                    // Track whether any content was received.
+                    if let content = chunk.choices.first?.delta.content, !content.isEmpty {
+                        receivedAnyContent = true
+                    }
+                    continuation.yield(chunk)
+                } catch {
+                    // Malformed chunk — log with diagnostics but continue the stream.
+                    NSLog("OpenAIClient: Failed to decode SSE chunk: \(error.localizedDescription). Data: \(dataString.prefix(200))")
+                }
+            }
+        }
+
+        // Stream ended (server closed the connection).
+        // Check for any remaining data in the line buffer.
+        let remaining = lineBuffer.trimmingCharacters(in: .whitespaces)
+        if !remaining.isEmpty, remaining.hasPrefix("data:") {
+            let dataString = remaining
+                .dropFirst(5)
+                .trimmingCharacters(in: .whitespaces)
+            if dataString != "[DONE]" {
+                if let data = dataString.data(using: .utf8) {
+                    do {
+                        let chunk = try JSONDecoder().decode(
+                            ChatCompletionStreamChunk.self,
+                            from: data
+                        )
+                        if let content = chunk.choices.first?.delta.content, !content.isEmpty {
+                            receivedAnyContent = true
+                        }
+                        continuation.yield(chunk)
+                    } catch {
+                        NSLog("OpenAIClient: Failed to decode final SSE chunk: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+
+        // If the stream ended without [DONE] and without any content, that's an error.
+        if !receivedAnyContent {
+            throw OpenAIError.streamEndedWithoutContent
+        }
+
+        continuation.finish()
     }
 
     // MARK: - Private Helpers
@@ -280,5 +366,85 @@ struct OpenAIClient: Sendable {
             return String(string.prefix(500))
         }
         return "Unknown error"
+    }
+}
+
+// MARK: - UTF-8 Incremental Decoder
+
+/// A stateful decoder that converts individual bytes into Unicode characters,
+/// correctly handling multi-byte UTF-8 sequences that span chunk boundaries.
+///
+/// This is critical for SSE parsing because `URLSession.AsyncBytes` delivers
+/// data in arbitrary chunks, and a multi-byte character (e.g. an emoji or
+/// CJK character) may be split across two chunks.
+struct UTF8IncrementalDecoder: Sendable {
+    /// The result of decoding a single byte.
+    enum Result: Sendable {
+        /// Successfully decoded a character.
+        case success(Character)
+        /// The byte is part of a multi-byte sequence; more data is needed.
+        case needMoreData
+        /// The byte sequence is invalid UTF-8.
+        case failure
+    }
+
+    // State for tracking an in-progress multi-byte sequence.
+    private var pendingBytes: [UInt8] = []
+    private var expectedLength: Int = 0
+
+    /// Decodes a single byte, returning a character when the sequence is complete.
+    ///
+    /// - Parameter byte: The next byte from the stream.
+    /// - Returns: A `Result` indicating success, need for more data, or failure.
+    mutating func decode(_ byte: UInt8) -> Result {
+        // If we're in the middle of a multi-byte sequence, append the byte.
+        if !pendingBytes.isEmpty {
+            pendingBytes.append(byte)
+            if pendingBytes.count < expectedLength {
+                return .needMoreData
+            }
+            // Sequence complete — attempt to decode.
+            let completed = pendingBytes
+            pendingBytes = []
+            expectedLength = 0
+            if let char = decodeSequence(completed) {
+                return .success(char)
+            }
+            return .failure
+        }
+
+        // Start of a new sequence.
+        if byte < 0x80 {
+            // Single-byte ASCII character.
+            return .success(Character(UnicodeScalar(byte)))
+        } else if byte & 0xE0 == 0xC0 {
+            // 2-byte sequence.
+            pendingBytes = [byte]
+            expectedLength = 2
+            return .needMoreData
+        } else if byte & 0xF0 == 0xE0 {
+            // 3-byte sequence.
+            pendingBytes = [byte]
+            expectedLength = 3
+            return .needMoreData
+        } else if byte & 0xF8 == 0xF0 {
+            // 4-byte sequence.
+            pendingBytes = [byte]
+            expectedLength = 4
+            return .needMoreData
+        } else {
+            // Invalid leading byte (0x80-0xBF or 0xF8-0xFF).
+            return .failure
+        }
+    }
+
+    /// Attempts to decode a complete multi-byte UTF-8 sequence.
+    private func decodeSequence(_ bytes: [UInt8]) -> Character? {
+        let data = bytes.withUnsafeBufferPointer({ Data($0) })
+        guard let string = String(data: data, encoding: .utf8),
+              let char = string.first else {
+            return nil
+        }
+        return char
     }
 }
