@@ -167,6 +167,51 @@ struct OpenAIClient: Sendable {
         }
     }
 
+    /// Sends a streaming chat completion request and reports the HTTP status
+    /// code as soon as the response headers are received.
+    ///
+    /// This is useful for clearing the prompt editor as soon as the backend
+    /// accepts the request (HTTP 2xx), without waiting for the entire
+    /// response to finish.
+    ///
+    /// - Parameters:
+    ///   - model: The model identifier to use.
+    ///   - prompt: The user's prompt text.
+    ///   - onAccepted: A closure called with the HTTP status code as soon as
+    ///     the response headers are received. Called on the main actor.
+    /// - Returns: An `AsyncThrowingStream` of `ChatCompletionStreamChunk` values.
+    /// - Throws: `OpenAIError` if the request fails, the stream contains invalid
+    ///   UTF-8, or the stream ends without any valid content.
+    func streamChatCompletion(
+        model: String,
+        prompt: String,
+        onAccepted: @escaping @MainActor (Int) -> Void
+    ) -> AsyncThrowingStream<ChatCompletionStreamChunk, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await self.runStream(
+                        model: model,
+                        prompt: prompt,
+                        continuation: continuation,
+                        onAccepted: onAccepted
+                    )
+                } catch is CancellationError {
+                    // Cancellation is not an error — finish cleanly.
+                    continuation.finish()
+                } catch let error as OpenAIError {
+                    continuation.finish(throwing: error)
+                } catch {
+                    continuation.finish(throwing: OpenAIError.networkError(underlying: error))
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
     // MARK: - SSE Streaming Implementation
 
     /// Executes the streaming request and feeds parsed chunks into the continuation.
@@ -178,7 +223,8 @@ struct OpenAIClient: Sendable {
     private func runStream(
         model: String,
         prompt: String,
-        continuation: AsyncThrowingStream<ChatCompletionStreamChunk, Error>.Continuation
+        continuation: AsyncThrowingStream<ChatCompletionStreamChunk, Error>.Continuation,
+        onAccepted: (@MainActor (Int) -> Void)? = nil
     ) async throws {
         let url = baseURL.appendingPathComponent("chat/completions")
         var request = URLRequest(url: url)
@@ -219,6 +265,15 @@ struct OpenAIClient: Sendable {
                 statusCode: httpResponse.statusCode,
                 message: message
             )
+        }
+
+        // Report the HTTP status code as soon as the response is accepted.
+        // This allows the caller to clear the prompt editor immediately
+        // without waiting for the entire stream to finish.
+        if let onAccepted = onAccepted {
+            Task { @MainActor in
+                onAccepted(httpResponse.statusCode)
+            }
         }
 
         // Parse SSE events incrementally with proper UTF-8 handling.

@@ -5,9 +5,10 @@ import SwiftUI
 /// Layout (top to bottom):
 /// 1. Connection bar — base URL, API key button, connect button, status indicator
 /// 2. Model selector — a `Picker` populated from `GET /v1/models`
-/// 3. `VSplitView` with two resizable panels:
+/// 3. Workspace bar — current directory, browse button, access status
+/// 4. `VSplitView` with two resizable panels:
 ///    - Top: Prompt input + Send/Stop buttons
-///    - Bottom: Response display + performance stats
+///    - Bottom: Response display + performance stats + save chat buttons
 struct ContentView: View {
     @State private var viewModel = ChatViewModel()
     @State private var showAPIKeySheet = false
@@ -17,6 +18,8 @@ struct ContentView: View {
             connectionBar
             Divider()
             modelSelector
+            workspaceBar
+            Divider()
 
             VSplitView {
                 promptPanel
@@ -142,6 +145,58 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Workspace Bar
+
+    private var workspaceBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+
+            if let directory = viewModel.workspaceService.selectedDirectory {
+                Text(directory.path)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(directory.path)
+
+                switch viewModel.workspaceService.accessState {
+                case .accessible:
+                    statusBadge(text: "Workspace", color: .green)
+                case .needsRenewal:
+                    statusBadge(text: "Access Expired", color: .orange)
+                        .help("Workspace access must be renewed. Click Browse to re-select the folder.")
+                case .none:
+                    EmptyView()
+                }
+            } else {
+                Text("No workspace selected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Button {
+                viewModel.workspaceService.browse()
+            } label: {
+                Label("Browse", systemImage: "folder.badge.gearshape")
+            }
+            .controlSize(.small)
+
+            if viewModel.workspaceService.selectedDirectory != nil {
+                Button {
+                    viewModel.workspaceService.clear()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .controlSize(.small)
+                .help("Clear workspace selection")
+            }
+
+            Spacer()
+        }
+    }
+
     // MARK: - Prompt Panel (Top of VSplitView)
 
     private var promptPanel: some View {
@@ -239,6 +294,46 @@ struct ContentView: View {
             // Performance stats — only shown after a request completes.
             if let stats = viewModel.requestStats {
                 statsBar(stats: stats)
+            }
+
+            // Status message (save confirmation, errors, etc.)
+            if let message = viewModel.statusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+            }
+
+            // Save chat buttons — only shown in Chat mode (always visible here).
+            HStack(spacing: 8) {
+                Button {
+                    viewModel.saveChatAsNew()
+                } label: {
+                    Label("Save Chat", systemImage: "square.and.arrow.down")
+                }
+                .controlSize(.small)
+                .disabled(viewModel.conversation.isEmpty)
+
+                Button {
+                    viewModel.appendChatToExisting()
+                } label: {
+                    Label("Append to File", systemImage: "text.append")
+                }
+                .controlSize(.small)
+                .disabled(viewModel.conversation.isEmpty)
+
+                if !viewModel.conversation.isEmpty {
+                    Button {
+                        viewModel.clearConversation()
+                    } label: {
+                        Label("Clear History", systemImage: "trash")
+                    }
+                    .controlSize(.small)
+                    .tint(.red)
+                }
+
+                Spacer()
             }
         }
         .padding(12)
