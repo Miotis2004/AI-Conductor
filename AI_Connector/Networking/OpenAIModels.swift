@@ -8,12 +8,16 @@ struct OpenAIModel: Codable, Identifiable, Hashable, Sendable {
     let object: String
     let created: Int
     let ownedBy: String
+    /// The model's maximum context length in tokens, if reported by the server.
+    /// This is optional because not all OpenAI-compatible servers report it.
+    let maxModelLen: Int?
 
     enum CodingKeys: String, CodingKey {
         case id
         case object
         case created
         case ownedBy = "owned_by"
+        case maxModelLen = "max_model_len"
     }
 }
 

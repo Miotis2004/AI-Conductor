@@ -1,0 +1,48 @@
+{
+  "source": "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI-Conductor/AI_Connector/Views/AttachmentSummaryView.swift",
+  "tables": {
+    "Localizable": [
+      {
+        "comment": "",
+        "key": "Attachments (%lld)",
+        "location": {
+          "startingColumn": 26,
+          "startingLine": 18
+        }
+      },
+      {
+        "comment": "",
+        "key": "Remove all attachments",
+        "location": {
+          "startingColumn": 27,
+          "startingLine": 41
+        }
+      },
+      {
+        "comment": "",
+        "key": "~%lld tokens (est.)",
+        "location": {
+          "startingColumn": 30,
+          "startingLine": 28
+        }
+      },
+      {
+        "comment": "",
+        "key": "~%lld tok",
+        "location": {
+          "startingColumn": 30,
+          "startingLine": 81
+        }
+      },
+      {
+        "comment": "",
+        "key": "Remove attachment",
+        "location": {
+          "startingColumn": 31,
+          "startingLine": 93
+        }
+      }
+    ]
+  },
+  "version": 1
+}

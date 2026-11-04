@@ -1,0 +1,2 @@
+Target dependency graph (1 target)
+Target 'AI_Connector' in project 'AI_Connector' (no dependencies)

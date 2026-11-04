@@ -93,7 +93,7 @@ struct OpenAIClient: Sendable {
     ///
     /// - Parameters:
     ///   - model: The model identifier to use.
-    ///   - prompt: The user's prompt text.
+    ///   - prompt: The user's prompt text (may include attached file contents).
     /// - Returns: The full `ChatCompletionResponse`.
     /// - Throws: `OpenAIError` if the request fails or the response contains no choices.
     func sendChatCompletion(model: String, prompt: String) async throws -> ChatCompletionResponse {
@@ -126,6 +126,49 @@ struct OpenAIClient: Sendable {
         return decoded
     }
 
+    /// Sends a streaming chat completion request with a pre-assembled prompt
+    /// that may include attached file contents.
+    ///
+    /// This is the primary method used when files are attached to a prompt.
+    /// The `prompt` parameter should be the fully assembled prompt text
+    /// (user question + file contents with boundaries), produced by
+    /// `PromptAssembler`.
+    ///
+    /// - Parameters:
+    ///   - model: The model identifier to use.
+    ///   - prompt: The fully assembled prompt text.
+    ///   - onAccepted: A closure called with the HTTP status code as soon as
+    ///     the response headers are received. Called on the main actor.
+    /// - Returns: An `AsyncThrowingStream` of `ChatCompletionStreamChunk` values.
+    func streamChatCompletion(
+        model: String,
+        prompt: String,
+        onAccepted: @escaping @MainActor (Int) -> Void
+    ) -> AsyncThrowingStream<ChatCompletionStreamChunk, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await self.runStream(
+                        model: model,
+                        prompt: prompt,
+                        continuation: continuation,
+                        onAccepted: onAccepted
+                    )
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch let error as OpenAIError {
+                    continuation.finish(throwing: error)
+                } catch {
+                    continuation.finish(throwing: OpenAIError.networkError(underlying: error))
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
     // MARK: - Streaming Chat Completions
 
     /// Sends a streaming chat completion request to `POST /v1/chat/completions` with `stream: true`.
@@ -150,51 +193,6 @@ struct OpenAIClient: Sendable {
                         model: model,
                         prompt: prompt,
                         continuation: continuation
-                    )
-                } catch is CancellationError {
-                    // Cancellation is not an error — finish cleanly.
-                    continuation.finish()
-                } catch let error as OpenAIError {
-                    continuation.finish(throwing: error)
-                } catch {
-                    continuation.finish(throwing: OpenAIError.networkError(underlying: error))
-                }
-            }
-
-            continuation.onTermination = { _ in
-                task.cancel()
-            }
-        }
-    }
-
-    /// Sends a streaming chat completion request and reports the HTTP status
-    /// code as soon as the response headers are received.
-    ///
-    /// This is useful for clearing the prompt editor as soon as the backend
-    /// accepts the request (HTTP 2xx), without waiting for the entire
-    /// response to finish.
-    ///
-    /// - Parameters:
-    ///   - model: The model identifier to use.
-    ///   - prompt: The user's prompt text.
-    ///   - onAccepted: A closure called with the HTTP status code as soon as
-    ///     the response headers are received. Called on the main actor.
-    /// - Returns: An `AsyncThrowingStream` of `ChatCompletionStreamChunk` values.
-    /// - Throws: `OpenAIError` if the request fails, the stream contains invalid
-    ///   UTF-8, or the stream ends without any valid content.
-    func streamChatCompletion(
-        model: String,
-        prompt: String,
-        onAccepted: @escaping @MainActor (Int) -> Void
-    ) -> AsyncThrowingStream<ChatCompletionStreamChunk, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try await self.runStream(
-                        model: model,
-                        prompt: prompt,
-                        continuation: continuation,
-                        onAccepted: onAccepted
                     )
                 } catch is CancellationError {
                     // Cancellation is not an error — finish cleanly.

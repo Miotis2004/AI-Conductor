@@ -1,5 +1,5 @@
 {
-  "source": "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI_Connector/AI_Connector/ContentView.swift",
+  "source": "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI-Conductor/AI_Connector/ContentView.swift",
   "tables": {
     "Localizable": [
       {
@@ -7,7 +7,7 @@
         "key": "Base URL",
         "location": {
           "startingColumn": 23,
-          "startingLine": 51
+          "startingLine": 81
         }
       },
       {
@@ -15,7 +15,7 @@
         "key": "Configure the API key (stored in Keychain)",
         "location": {
           "startingColumn": 19,
-          "startingLine": 63
+          "startingLine": 93
         }
       },
       {
@@ -23,7 +23,7 @@
         "key": "Set API Key",
         "location": {
           "startingColumn": 48,
-          "startingLine": 59
+          "startingLine": 89
         }
       },
       {
@@ -31,7 +31,7 @@
         "key": "API Key Set",
         "location": {
           "startingColumn": 64,
-          "startingLine": 59
+          "startingLine": 89
         }
       },
       {
@@ -39,7 +39,15 @@
         "key": "Connect",
         "location": {
           "startingColumn": 27,
-          "startingLine": 74
+          "startingLine": 104
+        }
+      },
+      {
+        "comment": "",
+        "key": "ctx: %lld tokens",
+        "location": {
+          "startingColumn": 22,
+          "startingLine": 165
         }
       },
       {
@@ -47,7 +55,7 @@
         "key": "Model",
         "location": {
           "startingColumn": 20,
-          "startingLine": 119
+          "startingLine": 149
         }
       },
       {
@@ -55,7 +63,55 @@
         "key": "No models available",
         "location": {
           "startingColumn": 26,
-          "startingLine": 121
+          "startingLine": 151
+        }
+      },
+      {
+        "comment": "",
+        "key": "No workspace selected",
+        "location": {
+          "startingColumn": 22,
+          "startingLine": 207
+        }
+      },
+      {
+        "comment": "",
+        "key": "Workspace access must be renewed. Click Browse to re-select the folder.",
+        "location": {
+          "startingColumn": 31,
+          "startingLine": 202
+        }
+      },
+      {
+        "comment": "",
+        "key": "Clear workspace selection",
+        "location": {
+          "startingColumn": 23,
+          "startingLine": 230
+        }
+      },
+      {
+        "comment": "",
+        "key": "Hide workspace explorer",
+        "location": {
+          "startingColumn": 48,
+          "startingLine": 244
+        }
+      },
+      {
+        "comment": "",
+        "key": "Show workspace explorer",
+        "location": {
+          "startingColumn": 76,
+          "startingLine": 244
+        }
+      },
+      {
+        "comment": "",
+        "key": "Browse",
+        "location": {
+          "startingColumn": 23,
+          "startingLine": 215
         }
       },
       {
@@ -63,7 +119,7 @@
         "key": "Prompt",
         "location": {
           "startingColumn": 18,
-          "startingLine": 149
+          "startingLine": 252
         }
       },
       {
@@ -71,7 +127,7 @@
         "key": "Send",
         "location": {
           "startingColumn": 31,
-          "startingLine": 179
+          "startingLine": 285
         }
       },
       {
@@ -79,7 +135,7 @@
         "key": "Generating…",
         "location": {
           "startingColumn": 34,
-          "startingLine": 176
+          "startingLine": 282
         }
       },
       {
@@ -87,7 +143,7 @@
         "key": "Stop",
         "location": {
           "startingColumn": 31,
-          "startingLine": 194
+          "startingLine": 300
         }
       },
       {
@@ -95,7 +151,7 @@
         "key": "Response",
         "location": {
           "startingColumn": 18,
-          "startingLine": 211
+          "startingLine": 317
         }
       },
       {
@@ -103,7 +159,7 @@
         "key": "Waiting for response…",
         "location": {
           "startingColumn": 28,
-          "startingLine": 218
+          "startingLine": 324
         }
       },
       {
@@ -111,7 +167,31 @@
         "key": "The assistant's response will appear here.",
         "location": {
           "startingColumn": 28,
-          "startingLine": 219
+          "startingLine": 325
+        }
+      },
+      {
+        "comment": "",
+        "key": "Save Chat",
+        "location": {
+          "startingColumn": 27,
+          "startingLine": 364
+        }
+      },
+      {
+        "comment": "",
+        "key": "Append to File",
+        "location": {
+          "startingColumn": 27,
+          "startingLine": 372
+        }
+      },
+      {
+        "comment": "",
+        "key": "Clear History",
+        "location": {
+          "startingColumn": 31,
+          "startingLine": 381
         }
       },
       {
@@ -119,7 +199,7 @@
         "key": "est.",
         "location": {
           "startingColumn": 22,
-          "startingLine": 305
+          "startingLine": 451
         }
       },
       {
@@ -127,7 +207,7 @@
         "key": "Estimated locally — not reported by the server",
         "location": {
           "startingColumn": 27,
-          "startingLine": 308
+          "startingLine": 454
         }
       }
     ]

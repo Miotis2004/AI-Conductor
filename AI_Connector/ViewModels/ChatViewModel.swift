@@ -54,14 +54,39 @@ final class ChatViewModel {
     private var streamTask: Task<Void, Never>?
     /// The workspace service for managing the selected directory.
     let workspaceService: WorkspaceService
+    /// The workspace explorer service for directory enumeration.
+    let explorerService: WorkspaceExplorerService
+    /// The file inspector service for read-only file viewing.
+    let fileInspectorService: FileInspectorService
+    /// The attachment service for managing file attachments.
+    let attachmentService: AttachmentService
+    /// The context budget service for estimating context usage.
+    let contextBudgetService: ContextBudgetService
+    /// The prompt assembler for building structured model requests.
+    let promptAssembler: PromptAssembler
     /// The model identifier used for the most recent request, used for
     /// chat export headers.
     private var lastModelID: String?
+    /// A warning message about context budget, if any.
+    var contextWarning: String?
+    /// Whether the sidebar (workspace explorer) is visible.
+    var isSidebarVisible: Bool = true
 
     // MARK: - Init
 
     init() {
         self.workspaceService = WorkspaceService()
+        self.explorerService = WorkspaceExplorerService(workspaceService: workspaceService)
+        self.fileInspectorService = FileInspectorService(
+            workspaceService: workspaceService,
+            explorerService: explorerService
+        )
+        self.attachmentService = AttachmentService(
+            workspaceService: workspaceService,
+            explorerService: explorerService
+        )
+        self.contextBudgetService = ContextBudgetService()
+        self.promptAssembler = PromptAssembler()
         self.apiKey = KeychainStore.load() ?? ""
     }
 
@@ -115,6 +140,39 @@ final class ChatViewModel {
         // Capture the submitted prompt as an immutable value before sending.
         let submittedPrompt = prompt
 
+        // Assemble the final prompt, including any attached file contents.
+        // File contents are read at submission time and validated against
+        // the workspace boundary.
+        let finalPrompt: String
+        do {
+            if attachmentService.hasAttachments {
+                // Read all attachments and assemble the prompt.
+                let fileContents = try attachmentService.readAttachments()
+                let files = fileContents.map { (relativePath: $0.attachment.relativePath, content: $0.content) }
+                finalPrompt = promptAssembler.assemblePrompt(userPrompt: submittedPrompt, files: files)
+            } else {
+                // No attachments — use the plain prompt (preserves ordinary chat behavior).
+                finalPrompt = submittedPrompt
+            }
+        } catch {
+            statusMessage = "Failed to read attachments: \(error.localizedDescription)"
+            return
+        }
+
+        // Check context budget before sending.
+        if let model = models.first(where: { $0.id == modelID }) {
+            let budget = contextBudgetService.calculateBudget(
+                maxModelLen: model.maxModelLen,
+                promptText: finalPrompt,
+                attachmentTokenEstimates: attachmentService.attachments.map { $0.estimatedTokens }
+            )
+            contextWarning = contextBudgetService.warningMessage(for: budget)
+            if budget.exceedsBudget {
+                statusMessage = contextWarning
+                return
+            }
+        }
+
         // Rebuild the client in case the API key or base URL changed.
         guard let url = URL(string: baseURL) else {
             connectionState = .failed("Invalid base URL: \(baseURL)")
@@ -128,8 +186,11 @@ final class ChatViewModel {
         response = ""
         requestStats = nil
         statusMessage = nil
+        contextWarning = nil
 
         // Create a conversation entry for this exchange.
+        // Store the user's original prompt (not the assembled one with file
+        // contents) in the conversation history for display purposes.
         let entry = ConversationEntry(
             userPrompt: submittedPrompt,
             assistantResponse: "",
@@ -152,7 +213,7 @@ final class ChatViewModel {
 
         let stream = client.streamChatCompletion(
             model: modelID,
-            prompt: submittedPrompt,
+            prompt: finalPrompt,
             onAccepted: { [weak self] statusCode in
                 // Clear the prompt editor only after the backend accepts
                 // the request (HTTP 2xx). This does not wait for the
@@ -195,7 +256,7 @@ final class ChatViewModel {
                     await self.fallbackToNonStreaming(
                         client: client,
                         model: modelID,
-                        prompt: submittedPrompt,
+                        prompt: finalPrompt,
                         startTime: startTime
                     )
                 } else {
@@ -208,7 +269,7 @@ final class ChatViewModel {
                     await self.fallbackToNonStreaming(
                         client: client,
                         model: modelID,
-                        prompt: submittedPrompt,
+                        prompt: finalPrompt,
                         startTime: startTime
                     )
                 } else {
@@ -472,5 +533,63 @@ final class ChatViewModel {
         } catch {
             statusMessage = "Failed to append chat: \(error.localizedDescription)"
         }
+    }
+
+    // MARK: - Workspace Explorer
+
+    /// Refreshes the workspace explorer.
+    func refreshExplorer() {
+        explorerService.refresh()
+    }
+
+    /// Expands a directory in the workspace explorer.
+    func expandDirectory(entryID: String) {
+        explorerService.expand(entryID: entryID)
+    }
+
+    /// Collapses a directory in the workspace explorer.
+    func collapseDirectory(entryID: String) {
+        explorerService.collapse(entryID: entryID)
+    }
+
+    // MARK: - File Inspector
+
+    /// Inspects a file for display in the preview area.
+    func inspectFile(resolvedPath: String, relativePath: String) {
+        fileInspectorService.inspectFile(resolvedPath: resolvedPath, relativePath: relativePath)
+    }
+
+    /// Clears the file inspector selection.
+    func clearFileSelection() {
+        fileInspectorService.clearSelection()
+    }
+
+    // MARK: - Attachments
+
+    /// Adds a file to the attachment list.
+    func attachFile(resolvedPath: String, relativePath: String) {
+        do {
+            try attachmentService.addAttachment(resolvedPath: resolvedPath, relativePath: relativePath)
+            statusMessage = nil
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    /// Removes an attachment by its identifier.
+    func removeAttachment(id: UUID) {
+        attachmentService.removeAttachment(id: id)
+    }
+
+    /// Removes all attachments.
+    func removeAllAttachments() {
+        attachmentService.removeAllAttachments()
+    }
+
+    // MARK: - Sidebar
+
+    /// Toggles the visibility of the workspace explorer sidebar.
+    func toggleSidebar() {
+        isSidebarVisible.toggle()
     }
 }

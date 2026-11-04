@@ -8,4 +8,10 @@ XCTMain([
     testCase(ChatExportSerializationTests.allTests),
     testCase(ChatExportFileTests.allTests),
     testCase(PromptClearingTests.allTests),
+    testCase(ContextBudgetServiceTests.allTests),
+    testCase(PromptAssemblerTests.allTests),
+    testCase(FileInspectorServiceStaticTests.allTests),
+    testCase(WorkspaceExplorerServiceLogicTests.allTests),
+    testCase(FileAttachmentModelTests.allTests),
+    testCase(ContextBudgetModelTests.allTests),
 ])

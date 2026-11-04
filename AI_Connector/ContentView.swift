@@ -5,10 +5,12 @@ import SwiftUI
 /// Layout (top to bottom):
 /// 1. Connection bar — base URL, API key button, connect button, status indicator
 /// 2. Model selector — a `Picker` populated from `GET /v1/models`
-/// 3. Workspace bar — current directory, browse button, access status
-/// 4. `VSplitView` with two resizable panels:
-///    - Top: Prompt input + Send/Stop buttons
-///    - Bottom: Response display + performance stats + save chat buttons
+/// 3. Workspace bar — current directory, browse button, access status, sidebar toggle
+/// 4. `HSplitView` with:
+///    - Left: Collapsible workspace explorer sidebar (directory tree + file inspector)
+///    - Right: `VSplitView` with:
+///      - Top: Prompt input + attachment summary + Send/Stop buttons
+///      - Bottom: Response display + performance stats + save chat buttons
 struct ContentView: View {
     @State private var viewModel = ChatViewModel()
     @State private var showAPIKeySheet = false
@@ -21,16 +23,25 @@ struct ContentView: View {
             workspaceBar
             Divider()
 
-            VSplitView {
-                promptPanel
-                    .frame(minHeight: 120)
-                    .layoutPriority(1)
+            HSplitView {
+                // Left: Workspace explorer sidebar (collapsible)
+                if viewModel.isSidebarVisible {
+                    sidebar
+                        .frame(minWidth: 200, idealWidth: 250, maxWidth: 400)
+                }
 
-                responsePanel
-                    .frame(minHeight: 120)
-                    .layoutPriority(1)
+                // Right: Main chat area
+                VSplitView {
+                    promptPanel
+                        .frame(minHeight: 120)
+                        .layoutPriority(1)
+
+                    responsePanel
+                        .frame(minHeight: 120)
+                        .layoutPriority(1)
+                }
+                .frame(minWidth: 320, minHeight: 300)
             }
-            .frame(minHeight: 300)
         }
         .padding(16)
         .frame(minWidth: 520, minHeight: 480)
@@ -41,6 +52,22 @@ struct ContentView: View {
             Task {
                 await viewModel.connect()
             }
+        }
+    }
+
+    // MARK: - Sidebar
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            // Workspace explorer (top half)
+            WorkspaceExplorerView(viewModel: viewModel)
+                .frame(maxHeight: .infinity)
+
+            Divider()
+
+            // File inspector (bottom half)
+            FileInspectorView(viewModel: viewModel)
+                .frame(maxHeight: .infinity)
         }
     }
 
@@ -132,6 +159,14 @@ struct ContentView: View {
             .labelsHidden()
             .disabled(viewModel.models.isEmpty || viewModel.connectionState == .connecting)
 
+            // Show max context info if available
+            if let model = viewModel.models.first(where: { $0.id == viewModel.selectedModelID }),
+               let maxLen = model.maxModelLen {
+                Text("ctx: \(maxLen) tokens")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
             switch viewModel.connectionState {
             case .failed(let message):
                 Text(message)
@@ -184,6 +219,8 @@ struct ContentView: View {
             if viewModel.workspaceService.selectedDirectory != nil {
                 Button {
                     viewModel.workspaceService.clear()
+                    viewModel.removeAllAttachments()
+                    viewModel.clearFileSelection()
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
@@ -194,6 +231,17 @@ struct ContentView: View {
             }
 
             Spacer()
+
+            // Sidebar toggle
+            Button {
+                viewModel.toggleSidebar()
+            } label: {
+                Image(systemName: viewModel.isSidebarVisible ? "sidebar.left" : "sidebar.leading")
+                    .foregroundStyle(viewModel.isSidebarVisible ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .controlSize(.small)
+            .help(viewModel.isSidebarVisible ? "Hide workspace explorer" : "Show workspace explorer")
         }
     }
 
@@ -217,6 +265,9 @@ struct ContentView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                 )
+
+            // Attachment summary (shown when files are attached)
+            AttachmentSummaryView(viewModel: viewModel)
 
             HStack(spacing: 8) {
                 Button {

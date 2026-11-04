@@ -1,0 +1,48 @@
+{
+  "source": "/Volumes/Samsung 970 EVO Plus/Coding Tests/AI-Conductor/AI_Connector/Views/WorkspaceExplorerView.swift",
+  "tables": {
+    "Localizable": [
+      {
+        "comment": "",
+        "key": "Workspace",
+        "location": {
+          "startingColumn": 22,
+          "startingLine": 17
+        }
+      },
+      {
+        "comment": "",
+        "key": "Refresh workspace",
+        "location": {
+          "startingColumn": 23,
+          "startingLine": 32
+        }
+      },
+      {
+        "comment": "",
+        "key": "No workspace selected",
+        "location": {
+          "startingColumn": 26,
+          "startingLine": 48
+        }
+      },
+      {
+        "comment": "",
+        "key": "Empty directory",
+        "location": {
+          "startingColumn": 26,
+          "startingLine": 53
+        }
+      },
+      {
+        "comment": "",
+        "key": "Attach to Prompt",
+        "location": {
+          "startingColumn": 27,
+          "startingLine": 150
+        }
+      }
+    ]
+  },
+  "version": 1
+}
