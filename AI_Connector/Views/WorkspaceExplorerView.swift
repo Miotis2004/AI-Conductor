@@ -131,25 +131,53 @@ struct WorkspaceExplorerView: View {
                     viewModel.expandDirectory(entryID: entry.id)
                 }
             } else {
-                // Select file for inspection
-                selectedEntryID = entry.id
-                viewModel.inspectFile(
-                    resolvedPath: entry.resolvedPath,
-                    relativePath: entry.relativePath
-                )
+                if viewModel.appMode == .code {
+                    // In code mode: toggle file selection for modification
+                    selectedEntryID = entry.id
+                    let isSelected = viewModel.codeModificationService.selectedFiles.contains(entry.relativePath)
+                    if isSelected {
+                        viewModel.deselectFileFromModification(relativePath: entry.relativePath)
+                    } else {
+                        viewModel.selectFileForModification(relativePath: entry.relativePath)
+                    }
+                } else {
+                    // Select file for inspection
+                    selectedEntryID = entry.id
+                    viewModel.inspectFile(
+                        resolvedPath: entry.resolvedPath,
+                        relativePath: entry.relativePath
+                    )
+                }
             }
         }
         .contextMenu {
             if !entry.isDirectory {
-                Button {
-                    viewModel.attachFile(
-                        resolvedPath: entry.resolvedPath,
-                        relativePath: entry.relativePath
-                    )
-                } label: {
-                    Label("Attach to Prompt", systemImage: "paperclip")
+                if viewModel.appMode == .code {
+                    let isSelected = viewModel.codeModificationService.selectedFiles.contains(entry.relativePath)
+                    Button {
+                        if isSelected {
+                            viewModel.deselectFileFromModification(relativePath: entry.relativePath)
+                        } else {
+                            viewModel.selectFileForModification(relativePath: entry.relativePath)
+                        }
+                    } label: {
+                        Label(
+                            isSelected ? "Deselect from Modification" : "Select for Modification",
+                            systemImage: isSelected ? "checkmark.circle" : "pencil"
+                        )
+                    }
+                    .disabled(viewModel.explorerService.isSensitiveFile(entry.relativePath))
+                } else {
+                    Button {
+                        viewModel.attachFile(
+                            resolvedPath: entry.resolvedPath,
+                            relativePath: entry.relativePath
+                        )
+                    } label: {
+                        Label("Attach to Prompt", systemImage: "paperclip")
+                    }
+                    .disabled(viewModel.explorerService.isSensitiveFile(entry.relativePath))
                 }
-                .disabled(viewModel.explorerService.isSensitiveFile(entry.relativePath))
             }
         }
 

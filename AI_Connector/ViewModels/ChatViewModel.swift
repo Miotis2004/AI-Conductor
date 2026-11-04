@@ -47,11 +47,14 @@ final class ChatViewModel {
     var conversation: ConversationHistory = ConversationHistory()
     /// A message to display to the user (e.g. save confirmation or error).
     var statusMessage: String?
+    /// The current application mode.
+    var appMode: AppMode = .chat
 
     // MARK: - Private
 
     private var client: OpenAIClient?
     private var streamTask: Task<Void, Never>?
+    private let fileManager = FileManager.default
     /// The workspace service for managing the selected directory.
     let workspaceService: WorkspaceService
     /// The workspace explorer service for directory enumeration.
@@ -64,6 +67,8 @@ final class ChatViewModel {
     let contextBudgetService: ContextBudgetService
     /// The prompt assembler for building structured model requests.
     let promptAssembler: PromptAssembler
+    /// The code modification service for AI-assisted code changes.
+    let codeModificationService: CodeModificationService
     /// The model identifier used for the most recent request, used for
     /// chat export headers.
     private var lastModelID: String?
@@ -87,6 +92,10 @@ final class ChatViewModel {
         )
         self.contextBudgetService = ContextBudgetService()
         self.promptAssembler = PromptAssembler()
+        self.codeModificationService = CodeModificationService(
+            workspaceService: workspaceService,
+            explorerService: explorerService
+        )
         self.apiKey = KeychainStore.load() ?? ""
     }
 
@@ -591,5 +600,337 @@ final class ChatViewModel {
     /// Toggles the visibility of the workspace explorer sidebar.
     func toggleSidebar() {
         isSidebarVisible.toggle()
+    }
+
+    // MARK: - Application Mode
+
+    /// Switches the application mode.
+    ///
+    /// Switching modes does not lose the conversation, workspace, or prompt.
+    /// Code mode requires a valid workspace.
+    func switchMode(_ mode: AppMode) {
+        if mode == .code {
+            guard workspaceService.selectedDirectory != nil,
+                  workspaceService.accessState == .accessible else {
+                statusMessage = "Code mode requires a valid workspace."
+                return
+            }
+        }
+        appMode = mode
+        // Invalidate any pending code modification proposal when leaving code mode.
+        if mode != .code {
+            codeModificationService.clear()
+        }
+    }
+
+    // MARK: - Code Modification
+
+    /// Selects a file for code modification.
+    func selectFileForModification(relativePath: String) {
+        codeModificationService.selectFile(relativePath: relativePath)
+    }
+
+    /// Deselects a file from code modification.
+    func deselectFileFromModification(relativePath: String) {
+        codeModificationService.deselectFile(relativePath: relativePath)
+    }
+
+    /// Clears all files selected for code modification.
+    func clearModificationFileSelection() {
+        codeModificationService.clearFileSelection()
+    }
+
+    /// Sends a code modification request to the model.
+    ///
+    /// Assembles a structured prompt with the selected file contents and
+    /// the user's instructions, sends it to the model, parses the JSON
+    /// response, validates the proposal, and presents it for review.
+    func sendCodeModification() async {
+        guard appMode == .code else { return }
+        guard let modelID = selectedModelID,
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        guard workspaceService.selectedDirectory != nil,
+              workspaceService.accessState == .accessible else {
+            statusMessage = "Code mode requires a valid workspace."
+            return
+        }
+
+        let submittedPrompt = prompt
+        let selectedFiles = codeModificationService.selectedFiles
+
+        guard !selectedFiles.isEmpty else {
+            statusMessage = "Select at least one file to modify."
+            return
+        }
+
+        // Read the selected files.
+        let fileContents: [(relativePath: String, content: String)]
+        do {
+            fileContents = try readSelectedFiles(selectedFiles)
+        } catch {
+            statusMessage = "Failed to read files: \(error.localizedDescription)"
+            return
+        }
+
+        // Build the modification prompt.
+        let finalPrompt: String
+        do {
+            finalPrompt = try codeModificationService.buildModificationPrompt(
+                userInstructions: submittedPrompt,
+                fileContents: fileContents
+            )
+        } catch {
+            statusMessage = error.localizedDescription
+            return
+        }
+
+        // Check context budget.
+        if let model = models.first(where: { $0.id == modelID }) {
+            let budget = contextBudgetService.calculateBudget(
+                maxModelLen: model.maxModelLen,
+                promptText: finalPrompt,
+                attachmentTokenEstimates: fileContents.map { max(1, $0.content.count / 4) }
+            )
+            contextWarning = contextBudgetService.warningMessage(for: budget)
+            if budget.exceedsBudget {
+                statusMessage = contextWarning
+                return
+            }
+        }
+
+        // Rebuild the client.
+        guard let url = URL(string: baseURL) else {
+            connectionState = .failed("Invalid base URL: \(baseURL)")
+            return
+        }
+        let client = OpenAIClient(baseURL: url, apiKey: apiKey)
+        self.client = client
+        self.lastModelID = modelID
+
+        isLoading = true
+        codeModificationService.isGenerating = true
+        response = ""
+        requestStats = nil
+        statusMessage = nil
+        contextWarning = nil
+
+        let startTime = Date()
+        var firstTokenTime: Date?
+        var receivedAnyContent = false
+        var serverReportedTokens: Int?
+        var wasAccepted = false
+
+        defer {
+            isLoading = false
+            codeModificationService.isGenerating = false
+            streamTask = nil
+        }
+
+        let stream = client.streamChatCompletion(
+            model: modelID,
+            prompt: finalPrompt,
+            onAccepted: { [weak self] statusCode in
+                if (200..<300).contains(statusCode) {
+                    wasAccepted = true
+                    self?.prompt = ""
+                }
+            }
+        )
+
+        streamTask = Task {
+            do {
+                for try await chunk in stream {
+                    if Task.isCancelled { break }
+
+                    if let delta = chunk.choices.first?.delta,
+                       let content = delta.content,
+                       !content.isEmpty {
+                        if !receivedAnyContent {
+                            firstTokenTime = Date()
+                            receivedAnyContent = true
+                        }
+                        response += content
+                    }
+
+                    if let usage = chunk.usage {
+                        serverReportedTokens = usage.completionTokens
+                    }
+                }
+            } catch let error as OpenAIError {
+                if !receivedAnyContent {
+                    await self.fallbackToNonStreaming(
+                        client: client,
+                        model: modelID,
+                        prompt: finalPrompt,
+                        startTime: startTime
+                    )
+                } else {
+                    self.response = "Error: \(error.localizedDescription)"
+                    self.connectionState = .failed(error.localizedDescription)
+                }
+            } catch {
+                if !receivedAnyContent {
+                    await self.fallbackToNonStreaming(
+                        client: client,
+                        model: modelID,
+                        prompt: finalPrompt,
+                        startTime: startTime
+                    )
+                } else {
+                    self.response = "Error: \(error.localizedDescription)"
+                    self.connectionState = .failed(error.localizedDescription)
+                }
+            }
+
+            if !wasAccepted {
+                self.prompt = submittedPrompt
+            }
+
+            // Compute stats.
+            let endTime = Date()
+            let totalElapsed = endTime.timeIntervalSince(startTime)
+            let ttft = firstTokenTime?.timeIntervalSince(startTime)
+
+            let estimatedTokens: Int?
+            if receivedAnyContent {
+                estimatedTokens = max(1, response.count / 4)
+            } else {
+                estimatedTokens = 0
+            }
+            let outputTokens = serverReportedTokens ?? estimatedTokens
+            let isServerReported = serverReportedTokens != nil
+
+            let tps: Double?
+            if let tokens = outputTokens, tokens > 0, let firstTime = firstTokenTime {
+                let generationTime = endTime.timeIntervalSince(firstTime)
+                tps = generationTime > 0 ? Double(tokens) / generationTime : nil
+            } else {
+                tps = nil
+            }
+
+            self.requestStats = RequestStats(
+                timeToFirstToken: ttft,
+                totalElapsed: totalElapsed,
+                outputTokens: outputTokens,
+                outputTokensIsServerReported: isServerReported,
+                averageTokensPerSecond: tps
+            )
+
+            // Parse the model response as a code modification proposal.
+            if receivedAnyContent, !response.isEmpty {
+                do {
+                    let workspacePath = workspaceService.selectedDirectory?.path ?? ""
+                    var proposal = try codeModificationService.parseModelResponse(
+                        response,
+                        userInstructions: submittedPrompt,
+                        modelID: modelID,
+                        workspacePath: workspacePath
+                    )
+                    proposal = try codeModificationService.finalizeProposal(proposal)
+                    self.statusMessage = "Proposal ready for review (\(proposal.fileCount) file\(proposal.fileCount == 1 ? "" : "s"))."
+                } catch let error as CodeModificationError {
+                    // The model response is not a valid proposal.
+                    // Display it as a regular response.
+                    self.statusMessage = "Model response is not a valid code modification proposal: \(error.localizedDescription)"
+                } catch {
+                    self.statusMessage = "Failed to parse model response: \(error.localizedDescription)"
+                }
+            }
+
+            if !Task.isCancelled {
+                self.connectionState = .connected
+            }
+        }
+
+        await streamTask?.value
+    }
+
+    /// Reads the content of the selected files for code modification.
+    private func readSelectedFiles(_ relativePaths: [String]) throws -> [(relativePath: String, content: String)] {
+        guard let workspaceURL = workspaceService.selectedDirectory,
+              workspaceService.accessState == .accessible else {
+            throw CodeModificationError.noWorkspace
+        }
+
+        let resolvedRoot = workspaceURL.resolvingSymlinksInPath().path
+
+        guard workspaceService.startAccessing() else {
+            throw CodeModificationError.workspaceNotAccessible
+        }
+        defer { workspaceService.stopAccessing() }
+
+        var results: [(relativePath: String, content: String)] = []
+
+        for relativePath in relativePaths {
+            let resolvedPath = workspaceURL.appendingPathComponent(relativePath).resolvingSymlinksInPath().path
+
+            guard explorerService.isWithinWorkspace(resolvedPath, resolvedRoot: resolvedRoot) else {
+                throw CodeModificationError.outsideWorkspace(path: relativePath)
+            }
+
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: resolvedPath, isDirectory: &isDirectory),
+                  !isDirectory.boolValue else {
+                throw CodeModificationError.fileNotFound(path: relativePath)
+            }
+
+            let data = try Data(contentsOf: URL(fileURLWithPath: resolvedPath))
+            let (isBinary, encoding) = FileInspectorService.detectEncoding(data: data)
+            if isBinary {
+                throw CodeModificationError.unsupportedFileType(path: relativePath)
+            }
+
+            let content = String(data: data, encoding: encoding ?? .utf8)
+                ?? String(decoding: data, as: UTF8.self)
+            results.append((relativePath, content))
+        }
+
+        return results
+    }
+
+    /// Approves the current code modification proposal and applies it.
+    func approveProposal() {
+        guard let proposal = codeModificationService.currentProposal,
+              proposal.isValid else {
+            statusMessage = "No valid proposal to approve."
+            return
+        }
+
+        do {
+            let changeSet = try codeModificationService.applyProposal(proposal)
+            statusMessage = "Applied \(changeSet.modifiedFiles.count + changeSet.createdFiles.count) file(s). You can undo this change."
+        } catch let error as CodeModificationError {
+            statusMessage = error.localizedDescription
+            if case .fileConflict = error {
+                codeModificationService.rejectProposal()
+            }
+        } catch {
+            statusMessage = "Failed to apply changes: \(error.localizedDescription)"
+        }
+    }
+
+    /// Rejects the current code modification proposal.
+    func rejectProposal() {
+        codeModificationService.rejectProposal()
+        statusMessage = "Proposal rejected. No files were modified."
+    }
+
+    /// Undoes the most recent code modification.
+    func undoLastChange() {
+        do {
+            let changeSet = try codeModificationService.undoLastChange()
+            statusMessage = "Reverted \(changeSet.modifiedFiles.count + changeSet.createdFiles.count) file(s)."
+        } catch let error as CodeModificationError {
+            statusMessage = error.localizedDescription
+        } catch {
+            statusMessage = "Failed to undo: \(error.localizedDescription)"
+        }
+    }
+
+    /// Invalidates the current proposal when the workspace changes.
+    func invalidateCodeModification() {
+        codeModificationService.invalidateOnWorkspaceChange()
     }
 }

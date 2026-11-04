@@ -20,6 +20,7 @@ struct ContentView: View {
             connectionBar
             Divider()
             modelSelector
+            modeSelector
             workspaceBar
             Divider()
 
@@ -30,15 +31,21 @@ struct ContentView: View {
                         .frame(minWidth: 200, idealWidth: 250, maxWidth: 400)
                 }
 
-                // Right: Main chat area
+                // Right: Main area (mode-dependent)
                 VSplitView {
                     promptPanel
                         .frame(minHeight: 120)
                         .layoutPriority(1)
 
-                    responsePanel
-                        .frame(minHeight: 120)
-                        .layoutPriority(1)
+                    if viewModel.appMode == .code {
+                        CodeReviewView(viewModel: viewModel)
+                            .frame(minHeight: 120)
+                            .layoutPriority(1)
+                    } else {
+                        responsePanel
+                            .frame(minHeight: 120)
+                            .layoutPriority(1)
+                    }
                 }
                 .frame(minWidth: 320, minHeight: 300)
             }
@@ -65,9 +72,14 @@ struct ContentView: View {
 
             Divider()
 
-            // File inspector (bottom half)
-            FileInspectorView(viewModel: viewModel)
-                .frame(maxHeight: .infinity)
+            // Bottom half: mode-dependent
+            if viewModel.appMode == .code {
+                CodeReviewView(viewModel: viewModel)
+                    .frame(maxHeight: .infinity)
+            } else {
+                FileInspectorView(viewModel: viewModel)
+                    .frame(maxHeight: .infinity)
+            }
         }
     }
 
@@ -180,6 +192,30 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Mode Selector
+
+    private var modeSelector: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "square.grid.2x2")
+                .foregroundStyle(.secondary)
+
+            Picker("Mode", selection: Binding(
+                get: { viewModel.appMode },
+                set: { viewModel.switchMode($0) }
+            )) {
+                ForEach(AppMode.allCases) { mode in
+                    Label(mode.rawValue, systemImage: mode.systemImage)
+                        .tag(mode)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 300)
+
+            Spacer()
+        }
+    }
+
     // MARK: - Workspace Bar
 
     private var workspaceBar: some View {
@@ -249,9 +285,18 @@ struct ContentView: View {
 
     private var promptPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Prompt")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            // Mode-specific header
+            HStack {
+                Text(viewModel.appMode == .code ? "Modification Instructions" : "Prompt")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if viewModel.appMode == .code {
+                    Text("\(viewModel.codeModificationService.selectedFiles.count)/\(viewModel.codeModificationService.maxFilesPerProposal) files selected")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
 
             TextEditor(text: $viewModel.prompt)
                 .font(.body)
@@ -266,23 +311,60 @@ struct ContentView: View {
                         .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                 )
 
-            // Attachment summary (shown when files are attached)
-            AttachmentSummaryView(viewModel: viewModel)
+            // Mode-specific content
+            if viewModel.appMode == .code {
+                // Selected files for modification
+                if !viewModel.codeModificationService.selectedFiles.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(viewModel.codeModificationService.selectedFiles, id: \.self) { path in
+                            HStack(spacing: 2) {
+                                Text((path as NSString).lastPathComponent)
+                                    .font(.caption2)
+                                Button {
+                                    viewModel.deselectFileFromModification(relativePath: path)
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 8))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(Color.accentColor.opacity(0.15))
+                            )
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 4)
+                }
+            } else {
+                // Attachment summary (shown when files are attached)
+                AttachmentSummaryView(viewModel: viewModel)
+            }
 
             HStack(spacing: 8) {
                 Button {
                     Task {
-                        await viewModel.send()
+                        if viewModel.appMode == .code {
+                            await viewModel.sendCodeModification()
+                        } else {
+                            await viewModel.send()
+                        }
                     }
                 } label: {
                     if viewModel.isLoading {
                         HStack(spacing: 8) {
                             ProgressView()
                                 .controlSize(.small)
-                            Text("Generating…")
+                            Text(viewModel.appMode == .code ? "Generating…" : "Generating…")
                         }
                     } else {
-                        Label("Send", systemImage: "paperplane.fill")
+                        Label(
+                            viewModel.appMode == .code ? "Propose Changes" : "Send",
+                            systemImage: viewModel.appMode == .code ? "chevron.left.forwardslash.chevron.right" : "paperplane.fill"
+                        )
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -291,6 +373,7 @@ struct ContentView: View {
                     viewModel.isLoading
                         || viewModel.selectedModelID == nil
                         || viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || (viewModel.appMode == .code && viewModel.codeModificationService.selectedFiles.isEmpty)
                 )
 
                 if viewModel.isLoading {

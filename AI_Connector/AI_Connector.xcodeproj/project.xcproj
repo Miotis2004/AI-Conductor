@@ -33,7 +33,7 @@
         "resources",
       ],
       "build-settings": {
-        "CODE_SIGN_ENTITLEMENTS": "AI_Connector/AI_Connector.entitlements",
+        "CODE_SIGN_ENTITLEMENTS": "AI_Connector.entitlements",
         "CODE_SIGN_STYLE": "Automatic",
         "CURRENT_PROJECT_VERSION": "1",
         "ENABLE_APP_SANDBOX": "YES",
