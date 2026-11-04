@@ -1,5 +1,5 @@
 import Foundation
-import Crypto
+import CryptoKit
 import Observation
 
 // MARK: - Code Modification Service
@@ -47,6 +47,10 @@ final class CodeModificationService {
     var canUndo: Bool { !changeHistory.isEmpty }
     /// A warning message about a partially failed apply or undo, if any.
     private(set) var lastWarning: String?
+    
+    func setGenerating(_ generating: Bool) {
+        isGenerating = generating
+    }
 
     // MARK: - Configuration
 
@@ -1356,17 +1360,33 @@ final class CodeModificationService {
     // MARK: - Private Helpers
 
     /// Converts a snapshot's encoding string to a `String.Encoding`.
-    private func encodingFromSnapshot(_ snapshot: FileSnapshot) -> String.Encoding {
-        guard let encodingStr = snapshot.encoding else { return .utf8 }
-        if let encoding = String.Encoding(rawValue: UInt(encodingStr)) {
-            return encoding
+    private func encodingFromSnapshot(
+        _ snapshot: FileSnapshot
+    ) -> String.Encoding {
+        guard let encodingStr = snapshot.encoding else {
+            return .utf8
         }
-        // Fallback: try to match by description.
+
+        if let rawValue = UInt(encodingStr) {
+            return String.Encoding(rawValue: rawValue)
+        }
+
+        // Compatibility with older recovery snapshots.
         let lower = encodingStr.lowercased()
-        if lower.contains("utf8") || lower.contains("utf-8") { return .utf8 }
-        if lower.contains("utf16") && lower.contains("little") { return .utf16LittleEndian }
-        if lower.contains("utf16") && lower.contains("big") { return .utf16BigEndian }
-        if lower.contains("latin") || lower.contains("iso") { return .isoLatin1 }
+
+        if lower.contains("utf8") || lower.contains("utf-8") {
+            return .utf8
+        }
+        if lower.contains("utf16") && lower.contains("little") {
+            return .utf16LittleEndian
+        }
+        if lower.contains("utf16") && lower.contains("big") {
+            return .utf16BigEndian
+        }
+        if lower.contains("latin") || lower.contains("iso") {
+            return .isoLatin1
+        }
+
         return .utf8
     }
 

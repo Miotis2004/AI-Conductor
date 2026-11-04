@@ -76,6 +76,7 @@ final class ChatViewModel {
     var contextWarning: String?
     /// Whether the sidebar (workspace explorer) is visible.
     var isSidebarVisible: Bool = true
+    
 
     // MARK: - Init
 
@@ -747,7 +748,7 @@ final class ChatViewModel {
         self.lastModelID = modelID
 
         isLoading = true
-        codeModificationService.isGenerating = true
+        codeModificationService.setGenerating(true)
         response = ""
         requestStats = nil
         statusMessage = nil
@@ -761,7 +762,7 @@ final class ChatViewModel {
 
         defer {
             isLoading = false
-            codeModificationService.isGenerating = false
+            codeModificationService.setGenerating(true)
             streamTask = nil
         }
 
