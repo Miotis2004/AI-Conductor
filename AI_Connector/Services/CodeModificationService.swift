@@ -491,9 +491,10 @@ final class CodeModificationService {
                 throw CodeModificationError.isDirectory(path: path)
             }
 
-            // Reject symbolic links.
-            let values = try? fileManager.attributesOfItem(atPath: resolvedPath)
-            if let type = values?[.type] as? FileAttributeType, type == .typeSymbolicLink {
+            // Check the original path without following the link.
+            if (try? fileManager.destinationOfSymbolicLink(
+                atPath: workspaceURL.appendingPathComponent(path).path
+            )) != nil {
                 throw CodeModificationError.symbolicLink(path: path)
             }
         }
@@ -525,13 +526,11 @@ final class CodeModificationService {
         // Check each parent directory (excluding the final component).
         for i in 0..<(components.count - 1) {
             let parentRelative = components[0...i].joined(separator: "/")
-            let parentPath = workspaceURL.appendingPathComponent(parentRelative).resolvingSymlinksInPath().path
-
-            // Check if the parent is a symlink.
-            let values = try? fileManager.attributesOfItem(atPath: parentPath)
-            if let type = values?[.type] as? FileAttributeType, type == .typeSymbolicLink {
+            let originalParent = workspaceURL.appendingPathComponent(parentRelative).path
+            if (try? fileManager.destinationOfSymbolicLink(atPath: originalParent)) != nil {
                 throw CodeModificationError.symlinkParentDirectory(path: relativePath)
             }
+            let parentPath = URL(fileURLWithPath: originalParent).resolvingSymlinksInPath().path
 
             // Verify the parent is still within the workspace.
             guard explorerService.isWithinWorkspace(parentPath, resolvedRoot: resolvedRoot) else {
@@ -774,9 +773,9 @@ final class CodeModificationService {
                     throw CodeModificationError.isDirectory(path: operation.path)
                 }
 
-                // Check for symbolic links.
-                let values = try? fileManager.attributesOfItem(atPath: resolvedPath)
-                if let type = values?[.type] as? FileAttributeType, type == .typeSymbolicLink {
+                if (try? fileManager.destinationOfSymbolicLink(
+                    atPath: workspaceURL.appendingPathComponent(operation.path).path
+                )) != nil {
                     throw CodeModificationError.symbolicLink(path: operation.path)
                 }
 
@@ -804,8 +803,10 @@ final class CodeModificationService {
                         throw CodeModificationError.unsupportedFileType(path: operation.path)
                     }
                     fileEncoding = encoding ?? .utf8
-                    currentContent = String(data: data, encoding: fileEncoding)
-                        ?? String(decoding: data, as: UTF8.self)
+                    guard let decoded = String(data: data, encoding: fileEncoding) else {
+                        throw CodeModificationError.unsupportedEncoding(path: operation.path, encoding: "\(fileEncoding)")
+                    }
+                    currentContent = decoded
 
                     // Detect line endings and trailing newline.
                     if let content = currentContent {
@@ -832,7 +833,9 @@ final class CodeModificationService {
             diffs[operation.path] = diff
 
             // Record a snapshot for conflict detection and rollback.
-            let contentHash = currentContent.map { SafeFileWriter.sha256Hash($0) } ?? ""
+            let contentHash = fileExists
+                ? SafeFileWriter.sha256Hash(try Data(contentsOf: URL(fileURLWithPath: resolvedPath)))
+                : ""
 
             snapshots.append(
                 FileSnapshot(
@@ -841,7 +844,7 @@ final class CodeModificationService {
                     content: currentContent ?? "",
                     existed: fileExists,
                     permissions: filePermissions,
-                    encoding: fileEncoding.description,
+                    encoding: String(fileEncoding.rawValue),
                     lineEnding: fileLineEnding,
                     hasTrailingNewline: fileHasTrailingNewline
                 )
@@ -957,6 +960,11 @@ final class CodeModificationService {
         }
         defer { workspaceService.stopAccessing() }
 
+        guard pendingSnapshots.count == proposal.operations.count,
+              currentProposal?.id == proposal.id else {
+            throw CodeModificationError.incompleteProposal(reason: "Proposal snapshots are missing or stale")
+        }
+
         // Phase 1: Validate all operations before beginning writes.
         for (index, operation) in proposal.operations.enumerated() {
             let resolvedPath = workspaceURL.appendingPathComponent(operation.path).resolvingSymlinksInPath().path
@@ -964,6 +972,8 @@ final class CodeModificationService {
             guard explorerService.isWithinWorkspace(resolvedPath, resolvedRoot: resolvedRoot) else {
                 throw CodeModificationError.outsideWorkspace(path: operation.path)
             }
+
+            try validatePath(operation.path)
 
             // Re-validate authorization for modify operations.
             if operation.type == .modify {
@@ -974,6 +984,20 @@ final class CodeModificationService {
             }
         }
 
+        // Persist a recovery journal before changing any workspace files.
+        let journal = RecoveryRecord(
+            changeSetID: proposal.id,
+            proposalID: proposal.id,
+            userInstructions: proposal.userInstructions,
+            modelID: proposal.modelID,
+            workspacePath: currentCanonical,
+            fileSnapshots: pendingSnapshots,
+            createdFiles: proposal.operations.filter { $0.type == .create }.map { $0.path },
+            modifiedFiles: proposal.operations.filter { $0.type == .modify }.map { $0.path },
+            fullyApplied: false
+        )
+        try recoveryStore.save(journal)
+
         // Phase 2: Write all files, tracking what was written for rollback.
         var writtenFiles: [(path: String, resolvedPath: String, snapshot: FileSnapshot)] = []
         var appliedHashes: [String: String] = [:]
@@ -981,6 +1005,8 @@ final class CodeModificationService {
         do {
             for (index, operation) in proposal.operations.enumerated() {
                 let resolvedPath = workspaceURL.appendingPathComponent(operation.path).resolvingSymlinksInPath().path
+
+                try validatePath(operation.path)
 
                 // Re-validate the path immediately before writing.
                 guard explorerService.isWithinWorkspace(resolvedPath, resolvedRoot: resolvedRoot) else {
@@ -1011,9 +1037,9 @@ final class CodeModificationService {
                     )
                 }
 
-                // Record the applied content hash.
-                let appliedHash = SafeFileWriter.sha256Hash(operation.content)
-                appliedHashes[operation.path] = appliedHash
+                // Hash the exact bytes written, including encoding and newlines.
+                let storedData = try Data(contentsOf: URL(fileURLWithPath: resolvedPath))
+                appliedHashes[operation.path] = SafeFileWriter.sha256Hash(storedData)
 
                 writtenFiles.append((operation.path, resolvedPath, snapshot))
             }
@@ -1022,6 +1048,22 @@ final class CodeModificationService {
             let unrestored = rollbackWrittenFiles(writtenFiles)
             if !unrestored.isEmpty {
                 lastWarning = "Apply failed and some files could not be restored: \(unrestored.joined(separator: ", ")). The workspace may be partially modified."
+                let partial = RecoveryRecord(
+                    changeSetID: journal.changeSetID,
+                    proposalID: journal.proposalID,
+                    userInstructions: journal.userInstructions,
+                    modelID: journal.modelID,
+                    workspacePath: journal.workspacePath,
+                    appliedAt: journal.appliedAt,
+                    fileSnapshots: journal.fileSnapshots,
+                    createdFiles: journal.createdFiles,
+                    modifiedFiles: journal.modifiedFiles,
+                    fullyApplied: false,
+                    unrestoredFiles: unrestored
+                )
+                try? recoveryStore.save(partial)
+            } else {
+                recoveryStore.delete(journal)
             }
             throw error
         }
@@ -1046,6 +1088,7 @@ final class CodeModificationService {
         }
 
         let changeSet = AppliedChangeSet(
+            id: proposal.id,
             proposalID: proposal.id,
             userInstructions: proposal.userInstructions,
             modelID: proposal.modelID,
@@ -1074,9 +1117,8 @@ final class CodeModificationService {
             lastWarning = "Changes were applied but the recovery record could not be saved: \(error.localizedDescription). Undo may not be available after restart."
         }
 
-        // Clear pending snapshots.
+        // Do not hide recovery persistence warnings.
         pendingSnapshots = []
-        lastWarning = nil
 
         return changeSet
     }
@@ -1138,6 +1180,11 @@ final class CodeModificationService {
             var isDirectory: ObjCBool = false
             let exists = fileManager.fileExists(atPath: resolvedPath, isDirectory: &isDirectory)
 
+            guard snapshot.appliedContentHash != nil else {
+                conflicts.append(snapshot.path)
+                continue
+            }
+
             if snapshot.existed {
                 // The file existed before — verify it matches the applied version.
                 guard exists, !isDirectory.boolValue else {
@@ -1183,6 +1230,15 @@ final class CodeModificationService {
             }
         }
 
+        // Re-check path safety for undo as well as content hashes.
+        for snapshot in changeSet.fileSnapshots {
+            do {
+                try validatePath(snapshot.path)
+            } catch {
+                conflicts.append(snapshot.path)
+            }
+        }
+
         // If any conflicts, refuse the entire undo.
         if !conflicts.isEmpty {
             throw CodeModificationError.undoConflicts(paths: conflicts)
@@ -1214,11 +1270,7 @@ final class CodeModificationService {
                             expectedHash: appliedHash
                         )
                     } else {
-                        // No applied hash — check if the file exists and delete it.
-                        var isDir: ObjCBool = false
-                        if fileManager.fileExists(atPath: resolvedPath, isDirectory: &isDir), !isDir.boolValue {
-                            try fileManager.removeItem(atPath: resolvedPath)
-                        }
+                        throw CodeModificationError.rollbackConflict(path: snapshot.path)
                     }
                 }
                 restored.append(snapshot.path)

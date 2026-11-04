@@ -86,7 +86,9 @@ final class RecoveryStore {
         for fileURL in fileURLs where fileURL.pathExtension == "json" {
             do {
                 let data = try Data(contentsOf: fileURL)
-                let record = try JSONDecoder().decode(RecoveryRecord.self, from: data)
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let record = try decoder.decode(RecoveryRecord.self, from: data)
 
                 // Validate the format version.
                 guard record.formatVersion == RecoveryRecord.currentFormatVersion else {
@@ -132,6 +134,7 @@ final class RecoveryStore {
         let all = loadAll()
         let canonical = URL(fileURLWithPath: workspacePath).resolvingSymlinksInPath().path
         return all.filter {
+            $0.fullyApplied &&
             URL(fileURLWithPath: $0.workspacePath).resolvingSymlinksInPath().path == canonical
         }
     }
@@ -162,13 +165,10 @@ final class RecoveryStore {
             )
         }
 
-        // Write atomically: temp file, then rename.
-        let tempURL = fileURL.appendingPathExtension("tmp-\(UUID().uuidString.prefix(8))")
+        // Atomic writes support both new and updated recovery records.
         do {
-            try data.write(to: tempURL, options: .atomic)
-            try fileManager.moveItem(at: tempURL, to: fileURL)
+            try data.write(to: fileURL, options: .atomic)
         } catch {
-            try? fileManager.removeItem(at: tempURL)
             throw CodeModificationError.backupFailed(
                 path: fileURL.lastPathComponent,
                 underlying: error

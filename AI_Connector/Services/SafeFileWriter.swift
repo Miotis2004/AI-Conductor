@@ -89,7 +89,9 @@ final class SafeFileWriter {
             hasTrailingNewline: hasTrailingNewline
         )
 
-        let data = Data(preparedContent.utf8)
+        guard let data = preparedContent.data(using: encoding, allowLossyConversion: false) else {
+            throw CodeModificationError.unsupportedEncoding(path: path, encoding: "\(encoding)")
+        }
 
         // Enforce the size limit.
         guard Int64(data.count) <= maxFileSize else {
@@ -118,21 +120,12 @@ final class SafeFileWriter {
             // Atomically replace the destination.
             // `replaceItemAt` atomically swaps the destination with the temp file.
             // The original file is preserved if this fails.
-            var replacedItem: URL?
-            let success = fileManager.replaceItemAt(destinationURL, withItemAt: tempURL, backupItemName: nil, options: [], resultingItemURL: &replacedItem)
-
-            if !success {
-                // Clean up the temp file.
-                try? fileManager.removeItem(at: tempURL)
-                throw CodeModificationError.writeFailed(
-                    path: path,
-                    underlying: NSError(
-                        domain: "SafeFileWriter",
-                        code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Atomic replacement failed"]
-                    )
-                )
-            }
+            _ = try fileManager.replaceItemAt(
+                destinationURL,
+                withItemAt: tempURL,
+                backupItemName: nil,
+                options: []
+            )
         } catch {
             // Clean up the temp file on failure.
             try? fileManager.removeItem(at: tempURL)
@@ -188,7 +181,9 @@ final class SafeFileWriter {
             hasTrailingNewline: hasTrailingNewline
         )
 
-        let data = Data(preparedContent.utf8)
+        guard let data = preparedContent.data(using: encoding, allowLossyConversion: false) else {
+            throw CodeModificationError.unsupportedEncoding(path: path, encoding: "\(encoding)")
+        }
 
         // Enforce the size limit.
         guard Int64(data.count) <= maxFileSize else {
@@ -246,6 +241,9 @@ final class SafeFileWriter {
             throw CodeModificationError.isDirectory(path: path)
         }
 
+        if (try? fileManager.destinationOfSymbolicLink(atPath: path)) != nil {
+            throw CodeModificationError.symbolicLink(path: path)
+        }
         // Verify the content matches the expected hash.
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         let currentHash = Self.sha256Hash(data)
@@ -296,7 +294,7 @@ final class SafeFileWriter {
         var result = lines.joined(separator: separator)
 
         // Add trailing newline if requested.
-        if hasTrailingNewline || (hadTrailingNewline && !hasTrailingNewline) {
+        if hasTrailingNewline {
             result += separator
         }
 
@@ -311,20 +309,13 @@ final class SafeFileWriter {
     /// - Returns: The detected line ending style.
     static func detectLineEnding(_ content: String) -> FileSnapshot.LineEndingStyle {
         let hasCRLF = content.contains("\r\n")
-        let hasCR = content.contains("\r") && !hasCRLF
-        let hasLF = content.contains("\n") && !hasCRLF && !hasCR
-
-        if hasCRLF && hasLF {
-            return .mixed
-        } else if hasCRLF {
-            return .crlf
-        } else if hasCR {
-            return .cr
-        } else if hasLF {
-            return .lf
-        } else {
-            return .lf
-        }
+        let withoutCRLF = content.replacingOccurrences(of: "\r\n", with: "")
+        let hasCR = withoutCRLF.contains("\r")
+        let hasLF = withoutCRLF.contains("\n")
+        if [hasCRLF, hasCR, hasLF].filter({ $0 }).count > 1 { return .mixed }
+        if hasCRLF { return .crlf }
+        if hasCR { return .cr }
+        return .lf
     }
 
     // MARK: - Trailing Newline Detection

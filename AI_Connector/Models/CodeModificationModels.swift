@@ -230,7 +230,7 @@ struct FileDiff: Sendable {
 
 /// A snapshot of a file's state at a point in time, used for conflict
 /// detection and rollback.
-struct FileSnapshot: Sendable {
+struct FileSnapshot: Codable, Sendable {
     /// The workspace-relative path of the file.
     let path: String
     /// The SHA-256 hash of the file's content at snapshot time (before the change).
