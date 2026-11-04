@@ -233,7 +233,7 @@ struct FileDiff: Sendable {
 struct FileSnapshot: Sendable {
     /// The workspace-relative path of the file.
     let path: String
-    /// The SHA-256 hash of the file's content at snapshot time.
+    /// The SHA-256 hash of the file's content at snapshot time (before the change).
     let contentHash: String
     /// The file's content at snapshot time (for rollback).
     let content: String
@@ -241,19 +241,50 @@ struct FileSnapshot: Sendable {
     let existed: Bool
     /// The file's permissions (POSIX mode) at snapshot time, if available.
     let permissions: Int?
+    /// The text encoding of the file at snapshot time (e.g. "utf8", "isoLatin1").
+    /// `nil` for new files or when encoding could not be determined.
+    let encoding: String?
+    /// The line ending style of the file at snapshot time.
+    let lineEnding: LineEndingStyle
+    /// Whether the file ended with a trailing newline at snapshot time.
+    let hasTrailingNewline: Bool
+    /// The SHA-256 hash of the file's content after the change was applied.
+    /// Used to verify the file hasn't been modified since the change was applied,
+    /// before performing an undo.
+    let appliedContentHash: String?
+
+    /// The line ending style of a file.
+    enum LineEndingStyle: String, Sendable, Codable {
+        /// Unix-style line endings (LF).
+        case lf = "lf"
+        /// Windows-style line endings (CRLF).
+        case crlf = "crlf"
+        /// Old Mac-style line endings (CR).
+        case cr = "cr"
+        /// Mixed or unknown line endings.
+        case mixed = "mixed"
+    }
 
     init(
         path: String,
         contentHash: String,
         content: String,
         existed: Bool,
-        permissions: Int? = nil
+        permissions: Int? = nil,
+        encoding: String? = nil,
+        lineEnding: LineEndingStyle = .lf,
+        hasTrailingNewline: Bool = false,
+        appliedContentHash: String? = nil
     ) {
         self.path = path
         self.contentHash = contentHash
         self.content = content
         self.existed = existed
         self.permissions = permissions
+        self.encoding = encoding
+        self.lineEnding = lineEnding
+        self.hasTrailingNewline = hasTrailingNewline
+        self.appliedContentHash = appliedContentHash
     }
 }
 
@@ -300,6 +331,104 @@ struct AppliedChangeSet: Identifiable, Sendable {
         self.fileSnapshots = fileSnapshots
         self.createdFiles = createdFiles
         self.modifiedFiles = modifiedFiles
+    }
+}
+
+// MARK: - Recovery Record
+
+/// A persistent recovery record for an applied change set.
+///
+/// Stored in the application's private Application Support directory as JSON.
+/// Preserves the information needed to undo a change set across application
+/// restarts. Never stored inside the user's project directories.
+///
+/// API credentials are never included in recovery records.
+struct RecoveryRecord: Codable, Sendable {
+    /// The version of the recovery record format.
+    let formatVersion: Int
+    /// The unique identifier of the change set.
+    let changeSetID: UUID
+    /// The proposal that was applied.
+    let proposalID: UUID
+    /// The user's instructions for the change.
+    let userInstructions: String
+    /// The model identifier used.
+    let modelID: String
+    /// The canonical path of the workspace where the change was applied.
+    let workspacePath: String
+    /// The timestamp when the change set was applied.
+    let appliedAt: Date
+    /// Snapshots of the files as they were before the change (for rollback).
+    let fileSnapshots: [FileSnapshot]
+    /// The paths of files that were created by this change set.
+    let createdFiles: [String]
+    /// The paths of files that were modified by this change set.
+    let modifiedFiles: [String]
+    /// Whether the change set was fully applied (all files written successfully).
+    let fullyApplied: Bool
+    /// Paths of files that could not be restored after a partial failure, if any.
+    let unrestoredFiles: [String]
+
+    /// The current version of the recovery record format.
+    static let currentFormatVersion = 1
+
+    init(
+        changeSetID: UUID,
+        proposalID: UUID,
+        userInstructions: String,
+        modelID: String,
+        workspacePath: String,
+        appliedAt: Date = Date(),
+        fileSnapshots: [FileSnapshot],
+        createdFiles: [String],
+        modifiedFiles: [String],
+        fullyApplied: Bool = true,
+        unrestoredFiles: [String] = []
+    ) {
+        self.formatVersion = Self.currentFormatVersion
+        self.changeSetID = changeSetID
+        self.proposalID = proposalID
+        self.userInstructions = userInstructions
+        self.modelID = modelID
+        self.workspacePath = workspacePath
+        self.appliedAt = appliedAt
+        self.fileSnapshots = fileSnapshots
+        self.createdFiles = createdFiles
+        self.modifiedFiles = modifiedFiles
+        self.fullyApplied = fullyApplied
+        self.unrestoredFiles = unrestoredFiles
+    }
+
+    /// Creates a `RecoveryRecord` from an `AppliedChangeSet`.
+    init(from changeSet: AppliedChangeSet, fullyApplied: Bool = true, unrestoredFiles: [String] = []) {
+        self.init(
+            changeSetID: changeSet.id,
+            proposalID: changeSet.proposalID,
+            userInstructions: changeSet.userInstructions,
+            modelID: changeSet.modelID,
+            workspacePath: changeSet.workspacePath,
+            appliedAt: changeSet.appliedAt,
+            fileSnapshots: changeSet.fileSnapshots,
+            createdFiles: changeSet.createdFiles,
+            modifiedFiles: changeSet.modifiedFiles,
+            fullyApplied: fullyApplied,
+            unrestoredFiles: unrestoredFiles
+        )
+    }
+
+    /// Converts this recovery record to an `AppliedChangeSet` for in-memory use.
+    var appliedChangeSet: AppliedChangeSet {
+        AppliedChangeSet(
+            id: changeSetID,
+            proposalID: proposalID,
+            userInstructions: userInstructions,
+            modelID: modelID,
+            workspacePath: workspacePath,
+            appliedAt: appliedAt,
+            fileSnapshots: fileSnapshots,
+            createdFiles: createdFiles,
+            modifiedFiles: modifiedFiles
+        )
     }
 }
 
@@ -359,6 +488,26 @@ enum CodeModificationError: LocalizedError {
     case emptyModelOutput
     /// The model output does not contain a valid proposal (ordinary chat response).
     case notAProposal
+    /// The proposal exceeds the maximum aggregate output size.
+    case proposalTooLarge(totalBytes: Int, limit: Int)
+    /// A single file in the proposal exceeds the maximum per-file output size.
+    case fileTooLarge(path: String, size: Int, limit: Int)
+    /// The proposal targets a path whose parent directory is a symbolic link.
+    case symlinkParentDirectory(path: String)
+    /// The proposal targets a path that is an unsupported filesystem object.
+    case unsupportedFileObject(path: String)
+    /// The proposal's workspace identity does not match the current workspace.
+    case workspaceIdentityMismatch
+    /// A recovery record was corrupted or incomplete.
+    case corruptedRecoveryRecord(reason: String)
+    /// The file's encoding is not supported for modification.
+    case unsupportedEncoding(path: String, encoding: String)
+    /// The proposal was invalidated because the workspace changed.
+    case proposalInvalidated(reason: String)
+    /// The undo operation encountered conflicts in multiple files.
+    case undoConflicts(paths: [String])
+    /// The undo operation could not be completed; some files could not be restored.
+    case undoPartialFailure(restored: [String], failed: [String])
 
     var errorDescription: String? {
         switch self {
@@ -414,6 +563,26 @@ enum CodeModificationError: LocalizedError {
             return "The model returned no output."
         case .notAProposal:
             return "The model response is not a code modification proposal."
+        case .proposalTooLarge(let totalBytes, let limit):
+            return "Proposal exceeds maximum aggregate size (\(totalBytes) bytes, limit \(limit) bytes)."
+        case .fileTooLarge(let path, let size, let limit):
+            return "File \(path) exceeds maximum size (\(size) bytes, limit \(limit) bytes)."
+        case .symlinkParentDirectory(let path):
+            return "Path \(path) is inside a symbolic-link directory and cannot be modified."
+        case .unsupportedFileObject(let path):
+            return "Path \(path) is an unsupported filesystem object."
+        case .workspaceIdentityMismatch:
+            return "The proposal was created for a different workspace and cannot be applied."
+        case .corruptedRecoveryRecord(let reason):
+            return "Recovery record is corrupted or incomplete: \(reason)"
+        case .unsupportedEncoding(let path, let encoding):
+            return "File \(path) uses unsupported encoding '\(encoding)' and cannot be safely modified."
+        case .proposalInvalidated(let reason):
+            return "Proposal invalidated: \(reason)"
+        case .undoConflicts(let paths):
+            return "Cannot undo: the following files have been modified since the change was applied: \(paths.joined(separator: ", "))"
+        case .undoPartialFailure(let restored, let failed):
+            return "Undo partially completed. Restored: \(restored.joined(separator: ", ")). Could not restore: \(failed.joined(separator: ", "))."
         }
     }
 }

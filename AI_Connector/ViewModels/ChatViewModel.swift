@@ -660,46 +660,83 @@ final class ChatViewModel {
         let submittedPrompt = prompt
         let selectedFiles = codeModificationService.selectedFiles
 
-        guard !selectedFiles.isEmpty else {
-            statusMessage = "Select at least one file to modify."
-            return
-        }
-
-        // Read the selected files.
-        let fileContents: [(relativePath: String, content: String)]
-        do {
-            fileContents = try readSelectedFiles(selectedFiles)
-        } catch {
-            statusMessage = "Failed to read files: \(error.localizedDescription)"
-            return
-        }
-
-        // Build the modification prompt.
-        let finalPrompt: String
-        do {
-            finalPrompt = try codeModificationService.buildModificationPrompt(
-                userInstructions: submittedPrompt,
-                fileContents: fileContents
-            )
-        } catch {
-            statusMessage = error.localizedDescription
-            return
-        }
-
-        // Check context budget.
-        if let model = models.first(where: { $0.id == modelID }) {
-            let budget = contextBudgetService.calculateBudget(
-                maxModelLen: model.maxModelLen,
-                promptText: finalPrompt,
-                attachmentTokenEstimates: fileContents.map { max(1, $0.content.count / 4) }
-            )
-            contextWarning = contextBudgetService.warningMessage(for: budget)
-            if budget.exceedsBudget {
-                statusMessage = contextWarning
-                return
+        // Allow create-only requests (no files selected).
+        // For modify requests, at least one file must be selected.
+        if !selectedFiles.isEmpty {
+            // Modify request: read the selected files.
+            let fileContents: [(relativePath: String, content: String)]
+            do {
+                fileContents = try readSelectedFiles(selectedFiles)
+                // Build the modification prompt.
+                let finalPrompt: String
+                do {
+                    finalPrompt = try codeModificationService.buildModificationPrompt(
+                        userInstructions: submittedPrompt,
+                        fileContents: fileContents
+                    )
+                    // Check context budget.
+                    if let model = models.first(where: { $0.id == modelID }) {
+                        let budget = contextBudgetService.calculateBudget(
+                            maxModelLen: model.maxModelLen,
+                            promptText: finalPrompt,
+                            attachmentTokenEstimates: fileContents.map { max(1, $0.content.count / 4) }
+                        )
+                        contextWarning = contextBudgetService.warningMessage(for: budget)
+                        if budget.exceedsBudget {
+                            statusMessage = contextWarning
+                            return
+                        }
+                    }
+                    // Continue with the request using the final prompt.
+                    await performCodeModificationRequest(
+                        modelID: modelID,
+                        finalPrompt: finalPrompt,
+                        submittedPrompt: submittedPrompt
+                    )
+                } catch {
+                    statusMessage = error.localizedDescription
+                }
+            } catch {
+                statusMessage = "Failed to read files: \(error.localizedDescription)"
+            }
+        } else {
+            // Create-only request: no files selected.
+            let finalPrompt: String
+            do {
+                finalPrompt = try codeModificationService.buildModificationPrompt(
+                    userInstructions: submittedPrompt,
+                    fileContents: []
+                )
+                // Check context budget.
+                if let model = models.first(where: { $0.id == modelID }) {
+                    let budget = contextBudgetService.calculateBudget(
+                        maxModelLen: model.maxModelLen,
+                        promptText: finalPrompt,
+                        attachmentTokenEstimates: []
+                    )
+                    contextWarning = contextBudgetService.warningMessage(for: budget)
+                    if budget.exceedsBudget {
+                        statusMessage = contextWarning
+                        return
+                    }
+                }
+                await performCodeModificationRequest(
+                    modelID: modelID,
+                    finalPrompt: finalPrompt,
+                    submittedPrompt: submittedPrompt
+                )
+            } catch {
+                statusMessage = error.localizedDescription
             }
         }
+    }
 
+    /// Performs the actual code modification request (streaming, parsing, finalization).
+    private func performCodeModificationRequest(
+        modelID: String,
+        finalPrompt: String,
+        submittedPrompt: String
+    ) async {
         // Rebuild the client.
         guard let url = URL(string: baseURL) else {
             connectionState = .failed("Invalid base URL: \(baseURL)")
@@ -831,8 +868,6 @@ final class ChatViewModel {
                     proposal = try codeModificationService.finalizeProposal(proposal)
                     self.statusMessage = "Proposal ready for review (\(proposal.fileCount) file\(proposal.fileCount == 1 ? "" : "s"))."
                 } catch let error as CodeModificationError {
-                    // The model response is not a valid proposal.
-                    // Display it as a regular response.
                     self.statusMessage = "Model response is not a valid code modification proposal: \(error.localizedDescription)"
                 } catch {
                     self.statusMessage = "Failed to parse model response: \(error.localizedDescription)"
@@ -900,9 +935,18 @@ final class ChatViewModel {
 
         do {
             let changeSet = try codeModificationService.applyProposal(proposal)
-            statusMessage = "Applied \(changeSet.modifiedFiles.count + changeSet.createdFiles.count) file(s). You can undo this change."
+            let fileCount = changeSet.modifiedFiles.count + changeSet.createdFiles.count
+            var msg = "Applied \(fileCount) file(s). You can undo this change."
+            if let warning = codeModificationService.lastWarning {
+                msg += " ⚠️ \(warning)"
+            }
+            statusMessage = msg
         } catch let error as CodeModificationError {
-            statusMessage = error.localizedDescription
+            var msg = error.localizedDescription
+            if let warning = codeModificationService.lastWarning {
+                msg += " ⚠️ \(warning)"
+            }
+            statusMessage = msg
             if case .fileConflict = error {
                 codeModificationService.rejectProposal()
             }
@@ -921,9 +965,18 @@ final class ChatViewModel {
     func undoLastChange() {
         do {
             let changeSet = try codeModificationService.undoLastChange()
-            statusMessage = "Reverted \(changeSet.modifiedFiles.count + changeSet.createdFiles.count) file(s)."
+            let fileCount = changeSet.modifiedFiles.count + changeSet.createdFiles.count
+            var msg = "Reverted \(fileCount) file(s)."
+            if let warning = codeModificationService.lastWarning {
+                msg += " ⚠️ \(warning)"
+            }
+            statusMessage = msg
         } catch let error as CodeModificationError {
-            statusMessage = error.localizedDescription
+            var msg = error.localizedDescription
+            if let warning = codeModificationService.lastWarning {
+                msg += " ⚠️ \(warning)"
+            }
+            statusMessage = msg
         } catch {
             statusMessage = "Failed to undo: \(error.localizedDescription)"
         }
@@ -932,5 +985,6 @@ final class ChatViewModel {
     /// Invalidates the current proposal when the workspace changes.
     func invalidateCodeModification() {
         codeModificationService.invalidateOnWorkspaceChange()
+        statusMessage = "Workspace changed. Any pending code modification proposal has been invalidated."
     }
 }

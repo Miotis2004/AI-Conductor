@@ -12,15 +12,18 @@ import Observation
 /// 2. **Model output parsing** — extracts and parses the JSON proposal from
 ///    the model's response, handling markdown code fences.
 /// 3. **Proposal validation** — validates operations, paths, file types,
-///    sensitive files, and workspace boundaries.
+///    sensitive files, workspace boundaries, file authorization, and
+///    resource limits.
 /// 4. **Diff generation** — computes line-by-line diffs between the current
 ///    file content and the proposed content.
 /// 5. **Conflict detection** — records SHA-256 hashes of files at proposal
 ///    time and verifies them before applying.
 /// 6. **Safe filesystem operations** — writes files atomically within the
-///    authorized workspace, preserving permissions.
+///    authorized workspace, preserving permissions, encoding, and line endings.
 /// 7. **Backup and rollback** — preserves original file content and supports
-///    undo of the most recent change set.
+///    undo of the most recent change set with conflict detection.
+/// 8. **Persistent recovery** — stores recovery records in the application's
+///    private Application Support directory for cross-restart undo.
 ///
 /// The service is `@MainActor`-isolated to match the project's
 /// `SWIFT_DEFAULT_ACTOR_ISOLATION` setting.
@@ -40,6 +43,10 @@ final class CodeModificationService {
     private(set) var changeHistory: [AppliedChangeSet] = []
     /// The currently selected files for code modification (workspace-relative paths).
     private(set) var selectedFiles: [String] = []
+    /// Whether an undo operation is available.
+    var canUndo: Bool { !changeHistory.isEmpty }
+    /// A warning message about a partially failed apply or undo, if any.
+    private(set) var lastWarning: String?
 
     // MARK: - Configuration
 
@@ -52,12 +59,23 @@ final class CodeModificationService {
     /// The maximum file size (in bytes) that can be modified.
     var maxFileSize: Int64 = 1_048_576 // 1 MB
 
+    /// The maximum aggregate proposal size (in bytes) across all files.
+    var maxAggregateProposalSize: Int64 = 5_242_880 // 5 MB
+
     // MARK: - Private
 
     private let workspaceService: WorkspaceService
     private let explorerService: WorkspaceExplorerService
     private let fileManager: FileManager
-    private let backupDirectory: URL
+    private let safeFileWriter: SafeFileWriter
+    private let recoveryStore: RecoveryStore
+
+    /// Pending file snapshots, stored between finalization and application.
+    private var pendingSnapshots: [FileSnapshot] = []
+
+    /// The workspace identity (canonical path) that the current proposal was
+    /// created for. Used to detect workspace changes.
+    private var proposalWorkspaceIdentity: String?
 
     // MARK: - Init
 
@@ -75,15 +93,36 @@ final class CodeModificationService {
         self.workspaceService = workspaceService
         self.explorerService = explorerService
         self.fileManager = fileManager
+        self.safeFileWriter = SafeFileWriter(fileManager: fileManager)
+        self.recoveryStore = RecoveryStore(fileManager: fileManager)
 
-        // Backups are stored in the app's private container, not in the user's
-        // source directories. This keeps the user's workspace clean.
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let appDir = appSupport.appendingPathComponent("AI_Connector", isDirectory: true)
-        self.backupDirectory = appDir.appendingPathComponent("Backups", isDirectory: true)
+        // Restore recovery history from disk.
+        restoreRecoveryHistory()
+    }
 
-        // Ensure the backup directory exists.
-        try? fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
+    // MARK: - Recovery History Restoration
+
+    /// Restores the in-memory change history from persistent recovery records.
+    ///
+    /// Called at initialization to recover undo history across application
+    /// restarts. Only records matching the current workspace are loaded.
+    private func restoreRecoveryHistory() {
+        guard let workspaceURL = workspaceService.selectedDirectory,
+              workspaceService.accessState == .accessible else {
+            return
+        }
+
+        let canonicalPath = workspaceURL.resolvingSymlinksInPath().path
+        let records = recoveryStore.load(forWorkspace: canonicalPath)
+
+        for record in records {
+            changeHistory.append(record.appliedChangeSet)
+        }
+
+        // Enforce the bounded history.
+        if changeHistory.count > maxHistorySize {
+            changeHistory.removeFirst(changeHistory.count - maxHistorySize)
+        }
     }
 
     // MARK: - File Selection
@@ -118,6 +157,9 @@ final class CodeModificationService {
     /// - The current content of each selected file (for modify operations).
     /// - The user's instructions for the modification.
     ///
+    /// For create-only requests (no files selected), the prompt instructs the
+    /// model to return a `create` operation with a workspace-relative path.
+    ///
     /// - Parameters:
     ///   - userInstructions: The user's description of the desired modification.
     ///   - fileContents: An array of `(relativePath, content)` tuples for the selected files.
@@ -131,10 +173,6 @@ final class CodeModificationService {
             throw CodeModificationError.incompleteProposal(reason: "No instructions provided")
         }
 
-        guard !fileContents.isEmpty else {
-            throw CodeModificationError.incompleteProposal(reason: "No files selected")
-        }
-
         guard fileContents.count <= maxFilesPerProposal else {
             throw CodeModificationError.tooManyFiles(count: fileContents.count, limit: maxFilesPerProposal)
         }
@@ -142,36 +180,69 @@ final class CodeModificationService {
         var parts: [String] = []
 
         // System instruction for the model.
-        parts.append("""
-        You are a code modification assistant. The user will provide the current content of one or more files and instructions for how to modify them.
+        if fileContents.isEmpty {
+            // Create-only request.
+            parts.append("""
+            You are a code modification assistant. The user wants to create a new file in their workspace.
 
-        You MUST respond with a JSON object (and nothing else) that follows this exact schema:
+            You MUST respond with a JSON object (and nothing else) that follows this exact schema:
 
-        {
-          "protocolVersion": 1,
-          "operations": [
             {
-              "type": "create" | "modify",
-              "path": "workspace-relative/path/to/file",
-              "content": "the complete new content of the file"
+              "protocolVersion": 1,
+              "operations": [
+                {
+                  "type": "create",
+                  "path": "workspace-relative/path/to/new/file",
+                  "content": "the complete content of the new file"
+                }
+              ]
             }
-          ]
+
+            Rules:
+            - "type" must be "create" for new files.
+            - "path" must be a workspace-relative path (no leading slash, no "..").
+            - "content" must be the COMPLETE content of the new file.
+            - You may propose at most \(maxFilesPerProposal) operations.
+            - Do NOT include any text outside the JSON object.
+            - Do NOT use markdown code fences. Return raw JSON only.
+            - The file must not already exist in the workspace.
+            - Use UTF-8 encoding with LF line endings for new files.
+
+            """)
+        } else {
+            // Modify request (with optional create operations).
+            parts.append("""
+            You are a code modification assistant. The user will provide the current content of one or more files and instructions for how to modify them.
+
+            You MUST respond with a JSON object (and nothing else) that follows this exact schema:
+
+            {
+              "protocolVersion": 1,
+              "operations": [
+                {
+                  "type": "create" | "modify",
+                  "path": "workspace-relative/path/to/file",
+                  "content": "the complete new content of the file"
+                }
+              ]
+            }
+
+            Rules:
+            - "type" must be either "create" (for new files) or "modify" (for existing files).
+            - "path" must be a workspace-relative path (no leading slash, no "..").
+            - "content" must be the COMPLETE content of the file after the modification.
+            - You may propose at most \(maxFilesPerProposal) operations.
+            - Do NOT include any text outside the JSON object.
+            - Do NOT use markdown code fences. Return raw JSON only.
+            - For "modify" operations, include the complete file content, not just the changed lines.
+            - Preserve the existing code style and formatting of the file.
+            - Only modify files that the user has provided. Do not reference files that were not provided.
+            - For "create" operations, the file must not already exist.
+
+            """)
         }
 
-        Rules:
-        - "type" must be either "create" (for new files) or "modify" (for existing files).
-        - "path" must be a workspace-relative path (no leading slash, no "..").
-        - "content" must be the COMPLETE content of the file after the modification.
-        - You may propose at most \(maxFilesPerProposal) operations.
-        - Do NOT include any text outside the JSON object.
-        - Do NOT use markdown code fences. Return raw JSON only.
-        - For "modify" operations, include the complete file content, not just the changed lines.
-        - Preserve the existing code style and formatting of the file.
-        - Only modify files that the user has provided. Do not reference files that were not provided.
-
-        """)
-
-        // File contents.
+        // File contents (only for modify requests).
         for file in fileContents {
             parts.append("<<<FILE: \(file.relativePath)")
             parts.append(file.content)
@@ -237,7 +308,8 @@ final class CodeModificationService {
 
         // Convert JSON operations to typed operations.
         var operations: [CodeModificationOperation] = []
-        var seenPaths = Set<String>()
+        var seenResolvedPaths = Set<String>()
+        var totalContentBytes = 0
 
         for opJSON in decoded.operations {
             // Validate operation type.
@@ -249,11 +321,25 @@ final class CodeModificationService {
             let path = opJSON.path
             try validatePath(path)
 
-            // Check for duplicates.
-            guard !seenPaths.contains(path) else {
+            // Check for duplicates (using resolved paths to catch different
+            // representations of the same file).
+            let resolvedPath = resolveWorkspacePath(path)
+            guard !seenResolvedPaths.contains(resolvedPath) else {
                 throw CodeModificationError.duplicatePath(path: path)
             }
-            seenPaths.insert(path)
+            seenResolvedPaths.insert(resolvedPath)
+
+            // Enforce per-file size limit.
+            let contentBytes = opJSON.content.utf8.count
+            guard contentBytes <= Int(maxFileSize) else {
+                throw CodeModificationError.fileTooLarge(
+                    path: path,
+                    size: contentBytes,
+                    limit: Int(maxFileSize)
+                )
+            }
+
+            totalContentBytes += contentBytes
 
             operations.append(
                 CodeModificationOperation(
@@ -273,6 +359,23 @@ final class CodeModificationService {
             throw CodeModificationError.incompleteProposal(reason: "No operations in proposal")
         }
 
+        // Enforce aggregate size limit.
+        guard Int64(totalContentBytes) <= maxAggregateProposalSize else {
+            throw CodeModificationError.proposalTooLarge(
+                totalBytes: totalContentBytes,
+                limit: Int(maxAggregateProposalSize)
+            )
+        }
+
+        // Validate file authorization: every modify operation must reference
+        // a file the user explicitly selected.
+        let authorizedFiles = Set(selectedFiles)
+        for op in operations where op.type == .modify {
+            guard authorizedFiles.contains(op.path) else {
+                throw CodeModificationError.unauthorizedFile(path: op.path)
+            }
+        }
+
         // Create the proposal.
         let proposal = CodeModificationProposal(
             userInstructions: userInstructions,
@@ -280,6 +383,9 @@ final class CodeModificationService {
             workspacePath: workspacePath,
             operations: operations
         )
+
+        // Record the workspace identity for this proposal.
+        proposalWorkspaceIdentity = workspacePath
 
         return proposal
     }
@@ -326,6 +432,7 @@ final class CodeModificationService {
     /// - Sensitive files
     /// - Paths that are directories
     /// - Symbolic links
+    /// - Paths whose parent directory is a symbolic link
     ///
     /// - Parameter path: The workspace-relative path to validate.
     /// - Throws: `CodeModificationError` if the path is invalid.
@@ -390,6 +497,58 @@ final class CodeModificationService {
                 throw CodeModificationError.symbolicLink(path: path)
             }
         }
+
+        // Check for symbolic-link parent directories.
+        // Walk up the path components and check if any parent is a symlink.
+        try validateNoSymlinkParents(
+            relativePath: path,
+            workspaceURL: workspaceURL,
+            resolvedRoot: resolvedRoot
+        )
+    }
+
+    /// Validates that no parent directory of the given path is a symbolic link.
+    ///
+    /// - Parameters:
+    ///   - relativePath: The workspace-relative path.
+    ///   - workspaceURL: The workspace root URL.
+    ///   - resolvedRoot: The resolved workspace root path.
+    /// - Throws: `CodeModificationError.symlinkParentDirectory` if a parent is a symlink.
+    private func validateNoSymlinkParents(
+        relativePath: String,
+        workspaceURL: URL,
+        resolvedRoot: String
+    ) throws {
+        let components = relativePath.split(separator: "/").map(String.init)
+        guard components.count > 1 else { return }
+
+        // Check each parent directory (excluding the final component).
+        for i in 0..<(components.count - 1) {
+            let parentRelative = components[0...i].joined(separator: "/")
+            let parentPath = workspaceURL.appendingPathComponent(parentRelative).resolvingSymlinksInPath().path
+
+            // Check if the parent is a symlink.
+            let values = try? fileManager.attributesOfItem(atPath: parentPath)
+            if let type = values?[.type] as? FileAttributeType, type == .typeSymbolicLink {
+                throw CodeModificationError.symlinkParentDirectory(path: relativePath)
+            }
+
+            // Verify the parent is still within the workspace.
+            guard explorerService.isWithinWorkspace(parentPath, resolvedRoot: resolvedRoot) else {
+                throw CodeModificationError.outsideWorkspace(path: relativePath)
+            }
+        }
+    }
+
+    /// Resolves a workspace-relative path to its canonical (resolved) path.
+    ///
+    /// - Parameter relativePath: The workspace-relative path.
+    /// - Returns: The resolved canonical path, or the original path if resolution fails.
+    private func resolveWorkspacePath(_ relativePath: String) -> String {
+        guard let workspaceURL = workspaceService.selectedDirectory else {
+            return relativePath
+        }
+        return workspaceURL.appendingPathComponent(relativePath).resolvingSymlinksInPath().path
     }
 
     // MARK: - Diff Generation
@@ -480,7 +639,6 @@ final class CodeModificationService {
         let newCount = newLines.count
 
         // Build the LCS table.
-        // dp[i][j] = length of LCS of oldLines[0..<i] and newLines[0..<j]
         var dp = [[Int]](repeating: [Int](repeating: 0, count: newCount + 1), count: oldCount + 1)
 
         for i in 1...oldCount {
@@ -511,12 +669,10 @@ final class CodeModificationService {
                 backtracked.append((.removed, i, 0, oldLines[i - 1]))
                 i -= 1
             } else {
-                // Fallback: should not reach here, but handle gracefully.
                 break
             }
         }
 
-        // Reverse to get the correct order.
         backtracked.reverse()
 
         // Assign line numbers.
@@ -574,6 +730,13 @@ final class CodeModificationService {
             throw CodeModificationError.noWorkspace
         }
 
+        // Verify workspace identity matches.
+        let currentCanonical = workspaceURL.resolvingSymlinksInPath().path
+        guard proposal.workspacePath == currentCanonical ||
+              URL(fileURLWithPath: proposal.workspacePath).resolvingSymlinksInPath().path == currentCanonical else {
+            throw CodeModificationError.workspaceIdentityMismatch
+        }
+
         let resolvedRoot = workspaceURL.resolvingSymlinksInPath().path
 
         guard workspaceService.startAccessing() else {
@@ -601,6 +764,10 @@ final class CodeModificationService {
             var currentContent: String? = nil
             var fileExists = false
             var isDirectory: ObjCBool = false
+            var fileEncoding: String.Encoding = .utf8
+            var fileLineEnding: FileSnapshot.LineEndingStyle = .lf
+            var fileHasTrailingNewline = false
+            var filePermissions: Int? = nil
 
             if fileManager.fileExists(atPath: resolvedPath, isDirectory: &isDirectory) {
                 if isDirectory.boolValue {
@@ -619,10 +786,15 @@ final class CodeModificationService {
                 let attributes = try? fileManager.attributesOfItem(atPath: resolvedPath)
                 let fileSize = Int64(attributes?[.size] as? Int ?? 0)
                 if fileSize > maxFileSize {
-                    throw CodeModificationError.invalidProposal(
-                        reason: "File exceeds size limit: \(operation.path)"
+                    throw CodeModificationError.fileTooLarge(
+                        path: operation.path,
+                        size: Int(fileSize),
+                        limit: Int(maxFileSize)
                     )
                 }
+
+                // Record permissions.
+                filePermissions = (attributes?[.posixPermissions] as? Int)
 
                 // Read the content.
                 do {
@@ -631,8 +803,15 @@ final class CodeModificationService {
                     if isBinary {
                         throw CodeModificationError.unsupportedFileType(path: operation.path)
                     }
-                    currentContent = String(data: data, encoding: encoding ?? .utf8)
+                    fileEncoding = encoding ?? .utf8
+                    currentContent = String(data: data, encoding: fileEncoding)
                         ?? String(decoding: data, as: UTF8.self)
+
+                    // Detect line endings and trailing newline.
+                    if let content = currentContent {
+                        fileLineEnding = SafeFileWriter.detectLineEnding(content)
+                        fileHasTrailingNewline = SafeFileWriter.hasTrailingNewline(content)
+                    }
                 } catch {
                     throw CodeModificationError.readFailed(path: operation.path, underlying: error)
                 }
@@ -653,13 +832,7 @@ final class CodeModificationService {
             diffs[operation.path] = diff
 
             // Record a snapshot for conflict detection and rollback.
-            let contentHash = currentContent.map { sha256Hash($0) } ?? ""
-            let permissions: Int?
-            if fileExists, let attrs = try? fileManager.attributesOfItem(atPath: resolvedPath) {
-                permissions = (attrs[.posixPermissions] as? Int)
-            } else {
-                permissions = nil
-            }
+            let contentHash = currentContent.map { SafeFileWriter.sha256Hash($0) } ?? ""
 
             snapshots.append(
                 FileSnapshot(
@@ -667,7 +840,10 @@ final class CodeModificationService {
                     contentHash: contentHash,
                     content: currentContent ?? "",
                     existed: fileExists,
-                    permissions: permissions
+                    permissions: filePermissions,
+                    encoding: fileEncoding.description,
+                    lineEnding: fileLineEnding,
+                    hasTrailingNewline: fileHasTrailingNewline
                 )
             )
         }
@@ -678,9 +854,7 @@ final class CodeModificationService {
         finalized.status = .pending
         finalized.errorMessage = nil
 
-        // Store snapshots in the proposal (via a side channel — we'll use
-        // the change history when applying).
-        // For now, we keep the snapshots in a temporary storage.
+        // Store snapshots for use during application.
         self.pendingSnapshots = snapshots
 
         currentProposal = finalized
@@ -727,7 +901,7 @@ final class CodeModificationService {
                 // Verify the hash.
                 do {
                     let data = try Data(contentsOf: URL(fileURLWithPath: resolvedPath))
-                    let currentHash = sha256Hash(String(data: data, encoding: .utf8) ?? "")
+                    let currentHash = SafeFileWriter.sha256Hash(data)
                     guard currentHash == snapshot.contentHash else {
                         throw CodeModificationError.fileConflict(path: snapshot.path)
                     }
@@ -749,8 +923,10 @@ final class CodeModificationService {
 
     /// Applies the current proposal, writing all files atomically.
     ///
-    /// This is a staged transaction: all files are written, and if any write
-    /// fails, the previously written files are rolled back.
+    /// This is a staged transaction: all files are validated first, then
+    /// written one by one. If any write fails, the previously written files
+    /// are rolled back. This is NOT a true filesystem-atomic transaction
+    /// across multiple independent files.
     ///
     /// - Parameter proposal: The proposal to apply.
     /// - Returns: The `AppliedChangeSet` record.
@@ -760,13 +936,19 @@ final class CodeModificationService {
             throw CodeModificationError.incompleteProposal(reason: "Proposal is not valid")
         }
 
-        // Verify no conflicts.
-        try verifyNoConflicts(proposal)
-
+        // Verify workspace identity.
         guard let workspaceURL = workspaceService.selectedDirectory,
               workspaceService.accessState == .accessible else {
             throw CodeModificationError.noWorkspace
         }
+
+        let currentCanonical = workspaceURL.resolvingSymlinksInPath().path
+        guard URL(fileURLWithPath: proposal.workspacePath).resolvingSymlinksInPath().path == currentCanonical else {
+            throw CodeModificationError.workspaceIdentityMismatch
+        }
+
+        // Verify no conflicts.
+        try verifyNoConflicts(proposal)
 
         let resolvedRoot = workspaceURL.resolvingSymlinksInPath().path
 
@@ -775,51 +957,100 @@ final class CodeModificationService {
         }
         defer { workspaceService.stopAccessing() }
 
-        // Phase 1: Write all files.
-        // Track what was written so we can roll back on failure.
+        // Phase 1: Validate all operations before beginning writes.
+        for (index, operation) in proposal.operations.enumerated() {
+            let resolvedPath = workspaceURL.appendingPathComponent(operation.path).resolvingSymlinksInPath().path
+
+            guard explorerService.isWithinWorkspace(resolvedPath, resolvedRoot: resolvedRoot) else {
+                throw CodeModificationError.outsideWorkspace(path: operation.path)
+            }
+
+            // Re-validate authorization for modify operations.
+            if operation.type == .modify {
+                let authorizedFiles = Set(selectedFiles)
+                guard authorizedFiles.contains(operation.path) else {
+                    throw CodeModificationError.unauthorizedFile(path: operation.path)
+                }
+            }
+        }
+
+        // Phase 2: Write all files, tracking what was written for rollback.
         var writtenFiles: [(path: String, resolvedPath: String, snapshot: FileSnapshot)] = []
+        var appliedHashes: [String: String] = [:]
 
         do {
             for (index, operation) in proposal.operations.enumerated() {
                 let resolvedPath = workspaceURL.appendingPathComponent(operation.path).resolvingSymlinksInPath().path
 
-                // Re-validate the path.
+                // Re-validate the path immediately before writing.
                 guard explorerService.isWithinWorkspace(resolvedPath, resolvedRoot: resolvedRoot) else {
                     throw CodeModificationError.outsideWorkspace(path: operation.path)
                 }
 
-                // Ensure the parent directory exists.
-                let parentDir = (resolvedPath as NSString).deletingLastPathComponent
-                if !fileManager.fileExists(atPath: parentDir) {
-                    try fileManager.createDirectory(
-                        atPath: parentDir,
-                        withIntermediateDirectories: true,
-                        attributes: nil
+                let snapshot = pendingSnapshots[index]
+
+                if operation.type == .modify {
+                    // Replace the existing file atomically.
+                    try safeFileWriter.replaceFile(
+                        content: operation.content,
+                        to: resolvedPath,
+                        permissions: snapshot.permissions,
+                        encoding: encodingFromSnapshot(snapshot),
+                        lineEnding: snapshot.lineEnding,
+                        hasTrailingNewline: snapshot.hasTrailingNewline
+                    )
+                } else {
+                    // Create the new file.
+                    try safeFileWriter.createFile(
+                        content: operation.content,
+                        to: resolvedPath,
+                        permissions: snapshot.permissions ?? 0o644,
+                        encoding: .utf8,
+                        lineEnding: .lf,
+                        hasTrailingNewline: true
                     )
                 }
 
-                // Write the file atomically.
-                try writeFileAtomically(
-                    content: operation.content,
-                    to: resolvedPath,
-                    permissions: pendingSnapshots[index].permissions
-                )
+                // Record the applied content hash.
+                let appliedHash = SafeFileWriter.sha256Hash(operation.content)
+                appliedHashes[operation.path] = appliedHash
 
-                writtenFiles.append((operation.path, resolvedPath, pendingSnapshots[index]))
+                writtenFiles.append((operation.path, resolvedPath, snapshot))
             }
         } catch {
             // Rollback: restore all previously written files.
-            rollbackWrittenFiles(writtenFiles)
+            let unrestored = rollbackWrittenFiles(writtenFiles)
+            if !unrestored.isEmpty {
+                lastWarning = "Apply failed and some files could not be restored: \(unrestored.joined(separator: ", ")). The workspace may be partially modified."
+            }
             throw error
         }
 
-        // Phase 2: All writes succeeded. Create the change set record.
+        // Phase 3: All writes succeeded. Create the change set record.
+        // Update snapshots with applied content hashes.
+        var finalSnapshots = pendingSnapshots
+        for i in 0..<finalSnapshots.count {
+            if let hash = appliedHashes[finalSnapshots[i].path] {
+                finalSnapshots[i] = FileSnapshot(
+                    path: finalSnapshots[i].path,
+                    contentHash: finalSnapshots[i].contentHash,
+                    content: finalSnapshots[i].content,
+                    existed: finalSnapshots[i].existed,
+                    permissions: finalSnapshots[i].permissions,
+                    encoding: finalSnapshots[i].encoding,
+                    lineEnding: finalSnapshots[i].lineEnding,
+                    hasTrailingNewline: finalSnapshots[i].hasTrailingNewline,
+                    appliedContentHash: hash
+                )
+            }
+        }
+
         let changeSet = AppliedChangeSet(
             proposalID: proposal.id,
             userInstructions: proposal.userInstructions,
             modelID: proposal.modelID,
-            workspacePath: workspaceURL.path,
-            fileSnapshots: pendingSnapshots,
+            workspacePath: currentCanonical,
+            fileSnapshots: finalSnapshots,
             createdFiles: proposal.operations.filter { $0.type == .create }.map { $0.path },
             modifiedFiles: proposal.operations.filter { $0.type == .modify }.map { $0.path }
         )
@@ -835,22 +1066,38 @@ final class CodeModificationService {
             changeHistory.removeFirst(changeHistory.count - maxHistorySize)
         }
 
+        // Persist the recovery record.
+        do {
+            let record = RecoveryRecord(from: changeSet)
+            try recoveryStore.save(record)
+        } catch {
+            lastWarning = "Changes were applied but the recovery record could not be saved: \(error.localizedDescription). Undo may not be available after restart."
+        }
+
         // Clear pending snapshots.
         pendingSnapshots = []
+        lastWarning = nil
 
         return changeSet
     }
 
-    // MARK: - Rollback
+    // MARK: - Rollback (Undo)
 
     /// Undoes the most recent change set.
     ///
-    /// Restores all files to their pre-change state. For created files,
-    /// the file is deleted. For modified files, the original content is
-    /// restored.
+    /// Before restoring any file, verifies that the current file content
+    /// matches the applied version (using SHA-256 hashes). If the file has
+    /// been modified since the change was applied, the restore is refused
+    /// to prevent overwriting subsequent user changes.
+    ///
+    /// For files created by AI Connector, the file is deleted only if its
+    /// content still matches the version originally created.
+    ///
+    /// All files in the change set are validated before any restoration
+    /// begins. If any file has a conflict, the entire undo is refused.
     ///
     /// - Returns: The `AppliedChangeSet` that was rolled back.
-    /// - Throws: `CodeModificationError` if the rollback fails.
+    /// - Throws: `CodeModificationError` if the rollback fails or encounters conflicts.
     func undoLastChange() throws -> AppliedChangeSet {
         guard !changeHistory.isEmpty else {
             throw CodeModificationError.incompleteProposal(reason: "No changes to undo")
@@ -863,6 +1110,13 @@ final class CodeModificationService {
             throw CodeModificationError.noWorkspace
         }
 
+        let currentCanonical = workspaceURL.resolvingSymlinksInPath().path
+
+        // Verify the workspace hasn't changed.
+        guard URL(fileURLWithPath: changeSet.workspacePath).resolvingSymlinksInPath().path == currentCanonical else {
+            throw CodeModificationError.workspaceChanged
+        }
+
         let resolvedRoot = workspaceURL.resolvingSymlinksInPath().path
 
         guard workspaceService.startAccessing() else {
@@ -870,54 +1124,124 @@ final class CodeModificationService {
         }
         defer { workspaceService.stopAccessing() }
 
-        // Verify the workspace hasn't changed.
-        guard workspaceURL.path == changeSet.workspacePath else {
-            throw CodeModificationError.workspaceChanged
-        }
+        // Phase 1: Validate ALL files before beginning any restoration.
+        var conflicts: [String] = []
 
-        // Rollback each file.
         for snapshot in changeSet.fileSnapshots {
             let resolvedPath = workspaceURL.appendingPathComponent(snapshot.path).resolvingSymlinksInPath().path
 
-            // Re-validate the path.
             guard explorerService.isWithinWorkspace(resolvedPath, resolvedRoot: resolvedRoot) else {
-                throw CodeModificationError.outsideWorkspace(path: snapshot.path)
+                conflicts.append(snapshot.path)
+                continue
             }
 
             var isDirectory: ObjCBool = false
             let exists = fileManager.fileExists(atPath: resolvedPath, isDirectory: &isDirectory)
 
             if snapshot.existed {
-                // The file existed before — restore its content.
+                // The file existed before — verify it matches the applied version.
                 guard exists, !isDirectory.boolValue else {
-                    throw CodeModificationError.rollbackConflict(path: snapshot.path)
+                    conflicts.append(snapshot.path)
+                    continue
                 }
 
-                // Verify the current content matches what we expect (the modified version).
-                // We don't have the modified content stored, so we just restore.
-                do {
-                    try writeFileAtomically(
-                        content: snapshot.content,
-                        to: resolvedPath,
-                        permissions: snapshot.permissions
-                    )
-                } catch {
-                    throw CodeModificationError.restoreFailed(path: snapshot.path, underlying: error)
+                // Verify the current content matches the applied version.
+                if let appliedHash = snapshot.appliedContentHash {
+                    do {
+                        let data = try Data(contentsOf: URL(fileURLWithPath: resolvedPath))
+                        let currentHash = SafeFileWriter.sha256Hash(data)
+                        guard currentHash == appliedHash else {
+                            conflicts.append(snapshot.path)
+                            continue
+                        }
+                    } catch {
+                        conflicts.append(snapshot.path)
+                        continue
+                    }
                 }
             } else {
-                // The file was created — delete it.
+                // The file was created — verify it still matches the created version.
                 if exists {
-                    do {
-                        try fileManager.removeItem(atPath: resolvedPath)
-                    } catch {
-                        throw CodeModificationError.restoreFailed(path: snapshot.path, underlying: error)
+                    guard !isDirectory.boolValue else {
+                        conflicts.append(snapshot.path)
+                        continue
+                    }
+                    if let appliedHash = snapshot.appliedContentHash {
+                        do {
+                            let data = try Data(contentsOf: URL(fileURLWithPath: resolvedPath))
+                            let currentHash = SafeFileWriter.sha256Hash(data)
+                            guard currentHash == appliedHash else {
+                                conflicts.append(snapshot.path)
+                                continue
+                            }
+                        } catch {
+                            conflicts.append(snapshot.path)
+                            continue
+                        }
                     }
                 }
             }
         }
 
-        // Remove from history.
+        // If any conflicts, refuse the entire undo.
+        if !conflicts.isEmpty {
+            throw CodeModificationError.undoConflicts(paths: conflicts)
+        }
+
+        // Phase 2: All files validated. Perform the restoration.
+        var restored: [String] = []
+        var failed: [String] = []
+
+        for snapshot in changeSet.fileSnapshots {
+            let resolvedPath = workspaceURL.appendingPathComponent(snapshot.path).resolvingSymlinksInPath().path
+
+            do {
+                if snapshot.existed {
+                    // Restore the original content.
+                    try safeFileWriter.replaceFile(
+                        content: snapshot.content,
+                        to: resolvedPath,
+                        permissions: snapshot.permissions,
+                        encoding: encodingFromSnapshot(snapshot),
+                        lineEnding: snapshot.lineEnding,
+                        hasTrailingNewline: snapshot.hasTrailingNewline
+                    )
+                } else {
+                    // Delete the created file (only if content matches).
+                    if let appliedHash = snapshot.appliedContentHash {
+                        try safeFileWriter.deleteFileIfUnchanged(
+                            path: resolvedPath,
+                            expectedHash: appliedHash
+                        )
+                    } else {
+                        // No applied hash — check if the file exists and delete it.
+                        var isDir: ObjCBool = false
+                        if fileManager.fileExists(atPath: resolvedPath, isDirectory: &isDir), !isDir.boolValue {
+                            try fileManager.removeItem(atPath: resolvedPath)
+                        }
+                    }
+                }
+                restored.append(snapshot.path)
+            } catch {
+                failed.append(snapshot.path)
+            }
+        }
+
+        // Phase 3: Handle the results.
+        if !failed.isEmpty {
+            // Some files could not be restored. Preserve the change set in history.
+            lastWarning = "Undo partially completed. Could not restore: \(failed.joined(separator: ", ")). The workspace may be in an inconsistent state."
+            throw CodeModificationError.undoPartialFailure(restored: restored, failed: failed)
+        }
+
+        // All files restored successfully. Remove from history.
         changeHistory.removeLast()
+
+        // Delete the recovery record.
+        let record = RecoveryRecord(from: changeSet)
+        recoveryStore.delete(record)
+
+        lastWarning = nil
 
         return changeSet
     }
@@ -948,79 +1272,71 @@ final class CodeModificationService {
         pendingSnapshots = []
         selectedFiles.removeAll()
         lastError = nil
+        lastWarning = nil
+        proposalWorkspaceIdentity = nil
     }
 
     // MARK: - Workspace Change Handling
 
     /// Invalidates the current proposal when the workspace changes.
-    func invalidateOnWorkspaceChange() {
+    ///
+    /// - Parameter newWorkspacePath: The new workspace path, or `nil` if cleared.
+    func invalidateOnWorkspaceChange(newWorkspacePath: String? = nil) {
+        // Invalidate any pending proposal.
         if let proposal = currentProposal, proposal.status == .pending {
             var updated = proposal
             updated.status = .discarded
             updated.errorMessage = "Workspace changed. Proposal invalidated."
             currentProposal = updated
         }
+
         pendingSnapshots = []
         selectedFiles.removeAll()
+        proposalWorkspaceIdentity = nil
+
+        // If the workspace was cleared, clear the change history for the old workspace.
+        if newWorkspacePath == nil {
+            // Keep the history in memory but it won't be usable without a workspace.
+            // The recovery records remain on disk for when the workspace is re-selected.
+        }
     }
 
     // MARK: - Private Helpers
 
-    /// Pending file snapshots, stored between finalization and application.
-    private var pendingSnapshots: [FileSnapshot] = []
-
-    /// Writes a file atomically using a temporary file and rename.
-    ///
-    /// - Parameters:
-    ///   - content: The content to write.
-    ///   - to: The destination path.
-    ///   - permissions: The POSIX permissions to apply, if any.
-    /// - Throws: `CodeModificationError.writeFailed` if the write fails.
-    private func writeFileAtomically(
-        content: String,
-        to path: String,
-        permissions: Int?
-    ) throws {
-        let destinationURL = URL(fileURLWithPath: path)
-        let tempURL = destinationURL.appendingPathExtension("tmp-\(UUID().uuidString.prefix(8))")
-
-        do {
-            // Write to the temporary file.
-            let data = Data(content.utf8)
-            try data.write(to: tempURL, options: .atomic)
-
-            // Apply permissions if specified.
-            if let perms = permissions {
-                try fileManager.setAttributes(
-                    [.posixPermissions: perms],
-                    ofItemAtPath: tempURL.path
-                )
-            }
-
-            // Atomically replace the destination.
-            if fileManager.fileExists(atPath: path) {
-                try fileManager.removeItem(atPath: path)
-            }
-            try fileManager.moveItem(at: tempURL, to: destinationURL)
-        } catch {
-            // Clean up the temp file on failure.
-            try? fileManager.removeItem(at: tempURL)
-            throw CodeModificationError.writeFailed(path: path, underlying: error)
+    /// Converts a snapshot's encoding string to a `String.Encoding`.
+    private func encodingFromSnapshot(_ snapshot: FileSnapshot) -> String.Encoding {
+        guard let encodingStr = snapshot.encoding else { return .utf8 }
+        if let encoding = String.Encoding(rawValue: UInt(encodingStr)) {
+            return encoding
         }
+        // Fallback: try to match by description.
+        let lower = encodingStr.lowercased()
+        if lower.contains("utf8") || lower.contains("utf-8") { return .utf8 }
+        if lower.contains("utf16") && lower.contains("little") { return .utf16LittleEndian }
+        if lower.contains("utf16") && lower.contains("big") { return .utf16BigEndian }
+        if lower.contains("latin") || lower.contains("iso") { return .isoLatin1 }
+        return .utf8
     }
 
     /// Rolls back files that were written during a failed apply operation.
+    ///
+    /// - Returns: An array of paths that could not be restored.
     private func rollbackWrittenFiles(
         _ writtenFiles: [(path: String, resolvedPath: String, snapshot: FileSnapshot)]
-    ) {
+    ) -> [String] {
+        var unrestored: [String] = []
+
         for file in writtenFiles.reversed() {
             do {
                 if file.snapshot.existed {
                     // Restore the original content.
-                    try writeFileAtomically(
+                    try safeFileWriter.replaceFile(
                         content: file.snapshot.content,
                         to: file.resolvedPath,
-                        permissions: file.snapshot.permissions
+                        permissions: file.snapshot.permissions,
+                        encoding: encodingFromSnapshot(file.snapshot),
+                        lineEnding: file.snapshot.lineEnding,
+                        hasTrailingNewline: file.snapshot.hasTrailingNewline
                     )
                 } else {
                     // Delete the created file.
@@ -1030,19 +1346,10 @@ final class CodeModificationService {
                 }
             } catch {
                 NSLog("CodeModificationService: Failed to rollback \(file.path): \(error.localizedDescription)")
+                unrestored.append(file.path)
             }
         }
-    }
 
-    // MARK: - SHA-256 Hashing
-
-    /// Computes the SHA-256 hash of a string.
-    ///
-    /// - Parameter string: The string to hash.
-    /// - Returns: The hex-encoded SHA-256 hash.
-    func sha256Hash(_ string: String) -> String {
-        let data = Data(string.utf8)
-        let hash = SHA256.hash(data: data)
-        return hash.compactMap { String(format: "%02x", $0) }.joined()
+        return unrestored
     }
 }

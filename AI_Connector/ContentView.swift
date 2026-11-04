@@ -246,7 +246,12 @@ struct ContentView: View {
             }
 
             Button {
+                let oldPath = viewModel.workspaceService.selectedDirectory?.path
                 viewModel.workspaceService.browse()
+                let newPath = viewModel.workspaceService.selectedDirectory?.path
+                if oldPath != newPath {
+                    viewModel.invalidateCodeModification()
+                }
             } label: {
                 Label("Browse", systemImage: "folder.badge.gearshape")
             }
@@ -257,6 +262,7 @@ struct ContentView: View {
                     viewModel.workspaceService.clear()
                     viewModel.removeAllAttachments()
                     viewModel.clearFileSelection()
+                    viewModel.invalidateCodeModification()
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)

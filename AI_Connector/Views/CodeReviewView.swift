@@ -75,6 +75,18 @@ struct CodeReviewView: View {
                     .padding(.horizontal, 8)
             }
 
+            // Warning message (e.g., partial recovery failure)
+            if let warning = viewModel.codeModificationService.lastWarning {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                    Text(warning)
+                        .font(.caption)
+                        .foregroundStyle(.yellow)
+                }
+                .padding(.horizontal, 8)
+            }
+
             // Diffs
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -110,7 +122,7 @@ struct CodeReviewView: View {
                 .disabled(proposal.status != .pending)
                 .help("Discard the proposal without applying changes")
 
-                if !viewModel.codeModificationService.changeHistory.isEmpty {
+                if viewModel.codeModificationService.canUndo {
                     Button {
                         viewModel.undoLastChange()
                     } label: {
@@ -119,6 +131,15 @@ struct CodeReviewView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
                     .help("Revert the most recent applied change")
+                } else {
+                    Button {
+                    } label: {
+                        Label("Undo Last", systemImage: "arrow.uturn.backward")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .disabled(true)
+                    .help("No changes to undo")
                 }
 
                 Spacer()
